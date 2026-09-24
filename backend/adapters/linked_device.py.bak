@@ -1,0 +1,201 @@
+# -*- coding: utf-8 -*-
+"""Linked device adapter.
+
+This is the route the proposal recommends for the client's approximately
+5,000 pre-existing groups, because the official Groups API cannot address
+them. It operates the existing WhatsApp account as a linked device, the same
+mechanism as WhatsApp Web.
+
+It talks to a small Node service (see ../../bridge) which holds the actual
+WhatsApp connection, because the mature multi device libraries are Node only.
+Start the bridge, scan the QR code with the handset that owns the number, and
+this adapter can enumerate and message the real groups on that account.
+
+Understand what this is before enabling it:
+  - It is not covered by WhatsApp's published API terms.
+  - The account carries a restriction risk. This is risk R1 in the proposal.
+  - Use it only on a number whose owner has authorised it in writing.
+Rate governance in dispatcher.py exists primarily to protect this route.
+"""
+import httpx
+
+import config
+from .base import SendResult, GroupRef
+
+
+class LinkedDeviceAdapter:
+    key = "linked_device"
+    label = "Linked device bridge (operates the existing WhatsApp account)"
+    can_address_existing_groups = True
+    asynchronous_status = True
+
+    def __init__(self):
+        self.base = config.BRIDGE_URL.rstrip("/")
+        self.token = config.BRIDGE_TOKEN
+
+    def _headers(self) -> dict:
+        return {"X-Bridge-Token": self.token, "Content-Type": "application/json"}
+
+    async def health(self) -> dict:
+        info = {
+            "adapter": self.key,
+            "label": self.label,
+            "sends_real_messages": True,
+            "bridge_url": self.base,
+            "ready": False,
+            "warnings": [
+                "Not covered by WhatsApp's published API terms.",
+                "Carries an account restriction risk (proposal risk R1).",
+                "Only use on a number whose owner has authorised it in writing.",
+            ],
+            "notes": [],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=8) as c:
+                r = await c.get(f"{self.base}/health", headers=self._headers())
+            if r.status_code == 200:
+                payload = r.json()
+                info.update({
+                    "ready": bool(payload.get("connected")),
+                    "bridge": payload,
+                })
+                if not payload.get("connected"):
+                    info["notes"].append(
+                        "Bridge is running but not linked. Open "
+                        f"{self.base}/qr and scan the code with the handset.")
+            else:
+                info["notes"].append(f"Bridge returned HTTP {r.status_code}.")
+        except Exception as exc:
+            info["notes"].append(
+                f"Bridge not reachable at {self.base}. Start it with: "
+                f"cd bridge && npm install && npm start  ({exc})")
+        return info
+
+    async def list_groups(self) -> list[GroupRef]:
+        """Enumerate the real groups the linked account belongs to. This is
+        the import path that the official API cannot provide."""
+        try:
+            async with httpx.AsyncClient(timeout=120) as c:
+                r = await c.get(f"{self.base}/groups", headers=self._headers())
+            if r.status_code != 200:
+                return []
+            return [
+                GroupRef(wa_group_id=g["id"], name=g.get("subject", "Untitled"),
+                         member_count=int(g.get("size", 0) or 0),
+                         source="linked_device")
+                for g in r.json().get("groups", [])
+            ]
+        except Exception:
+            return []
+
+    async def drain_receipts(self) -> list[dict]:
+        """Collect buffered delivery and read receipts. The bridge clears its
+        buffer on read, so each receipt is returned exactly once."""
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.get(f"{self.base}/receipts", headers=self._headers())
+            if r.status_code != 200:
+                return []
+            return r.json().get("receipts", [])
+        except Exception:
+            return []
+
+    async def drain_messages(self) -> list[dict]:
+        """Collect buffered group messages and reactions, live and historical."""
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.get(f"{self.base}/messages", headers=self._headers())
+            return r.json().get("messages", []) if r.status_code == 200 else []
+        except Exception:
+            return []
+
+    async def groups_full(self, refresh: bool = False) -> list[dict]:
+        """Every group with its full profile: description, settings, members."""
+        try:
+            async with httpx.AsyncClient(timeout=120) as c:
+                r = await c.get(f"{self.base}/groups", headers=self._headers(),
+                                params={"refresh": "1"} if refresh else None)
+            return r.json().get("groups", []) if r.status_code == 200 else []
+        except Exception:
+            return []
+
+    async def group(self, jid: str) -> dict | None:
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.get(f"{self.base}/group", headers=self._headers(),
+                                params={"jid": jid})
+            return r.json().get("group") if r.status_code == 200 else None
+        except Exception:
+            return None
+
+    async def request_history(self, jid: str, anchor_id: str, anchor_from_me: bool,
+                              anchor_ts_ms: int, count: int = 50) -> dict:
+        """Ask the phone for older messages, paging back from an anchor."""
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(f"{self.base}/history", headers=self._headers(), json={
+                    "jid": jid, "anchor_id": anchor_id, "anchor_from_me": anchor_from_me,
+                    "anchor_ts": anchor_ts_ms, "count": count})
+            return r.json()
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    async def send_chat(self, *, jid: str, text: str, media_path: str | None = None,
+                        media_mime: str | None = None, file_name: str | None = None,
+                        quoted: dict | None = None) -> dict:
+        """A single conversational message typed by an operator, as opposed to
+        a campaign despatch. Supports a quoted reply and one attachment."""
+        payload = {"to": jid, "body": text}
+        if media_path:
+            payload.update(media_path=media_path, media_mime=media_mime or "",
+                           caption=text, file_name=file_name or "")
+        if quoted:
+            payload["quoted"] = quoted
+        try:
+            async with httpx.AsyncClient(timeout=90) as c:
+                r = await c.post(f"{self.base}/send", headers=self._headers(), json=payload)
+            data = r.json() if r.content else {}
+            if r.status_code == 200 and data.get("ok"):
+                return {"ok": True, "id": data.get("id", "")}
+            return {"ok": False, "error": data.get("error") or f"HTTP {r.status_code}"}
+        except Exception as exc:
+            return {"ok": False, "error": f"Bridge unreachable: {exc}"}
+
+    async def drain_inbound(self) -> list[dict]:
+        """Collect buffered inbound group messages (metric M6)."""
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.get(f"{self.base}/inbound", headers=self._headers())
+            if r.status_code != 200:
+                return []
+            return r.json().get("messages", [])
+        except Exception:
+            return []
+
+    async def send(self, *, wa_group_id: str, body: str,
+                   media_path: str | None = None, media_mime: str | None = None,
+                   media_caption: str | None = None) -> SendResult:
+        payload = {"to": wa_group_id, "body": body}
+        if media_path:
+            payload["media_path"] = media_path
+            payload["media_mime"] = media_mime or "application/octet-stream"
+            payload["caption"] = media_caption or ""
+        try:
+            async with httpx.AsyncClient(timeout=60) as c:
+                r = await c.post(f"{self.base}/send", headers=self._headers(),
+                                 json=payload)
+            data = r.json() if r.content else {}
+        except Exception as exc:
+            return SendResult(ok=False, status="failed",
+                              error_title="Bridge unreachable",
+                              error_detail=str(exc)[:400], retryable=True)
+
+        if r.status_code == 200 and data.get("ok"):
+            return SendResult(ok=True, status="sent",
+                              provider_message_id=data.get("id", ""))
+        return SendResult(
+            ok=False, status="failed",
+            error_code=data.get("code"),
+            error_title=str(data.get("error", f"HTTP {r.status_code}"))[:280],
+            error_detail=str(data.get("detail", r.text))[:400],
+            retryable=bool(data.get("retryable", r.status_code >= 500)))

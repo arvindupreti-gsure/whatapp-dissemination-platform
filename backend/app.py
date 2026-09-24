@@ -1,0 +1,1438 @@
+# -*- coding: utf-8 -*-
+"""WhatsApp Dissemination & Analytics Platform: proof of concept API.
+
+Gsure Technologies Private Limited.
+"""
+import asyncio
+import csv
+import datetime as dt
+import io
+import json
+import secrets
+from pathlib import Path
+
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form
+from fastapi.responses import (JSONResponse, RedirectResponse, HTMLResponse,
+                               Response, FileResponse)
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import select, func, or_, delete as sqldelete
+
+import adapters
+import analytics
+import config
+import dispatcher
+import reports
+import security
+from db import (SessionLocal, init_db, User, Group, GroupList, GroupListMember,
+                Campaign, Delivery, Media, Template, TrackedLink, LinkEvent,
+                MediaEvent, Interaction, EventLog, AuditLog, Setting, utcnow)
+from tokens import make_media_token, read_media_token
+
+FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
+
+app = FastAPI(title="WDAP Proof of Concept", version="1.0.0",
+              docs_url="/api/docs", openapi_url="/api/openapi.json")
+
+
+# =========================================================== lifecycle
+@app.on_event("startup")
+async def _startup():
+    init_db()
+    from seed import ensure_seed
+    ensure_seed()
+    asyncio.create_task(dispatcher.maturation_loop())
+    asyncio.create_task(dispatcher._completion_loop())
+    asyncio.create_task(_scheduler_loop())
+    # Consumes delivery receipts and inbound replies from the linked device
+    # bridge. Idle and harmless when no bridge is running.
+    import receipts as receipts_mod
+    asyncio.create_task(receipts_mod.poll_loop())
+    dispatcher._loop_started = True
+    print(f"\n  Platform ready at {config.PUBLIC_BASE_URL}")
+    print(f"  Channel: {config.DEFAULT_CHANNEL}   Time scale: {config.TIME_SCALE}")
+    print(f"  Sign in with  admin@gsuretech.com / Gsure@2026\n")
+
+
+async def _scheduler_loop():
+    """Launches scheduled campaigns and rolls recurring ones forward (FR-04,
+    FR-05)."""
+    while True:
+        await asyncio.sleep(2.0)
+        try:
+            now = utcnow()
+            with SessionLocal() as s:
+                due = list(s.scalars(
+                    select(Campaign).where(Campaign.status == "scheduled",
+                                           Campaign.scheduled_at <= now)))
+                ids = [c.id for c in due]
+            for cid in ids:
+                try:
+                    await dispatcher.launch(cid)
+                except Exception as exc:
+                    dispatcher.log(cid, f"scheduled launch failed: {exc}", "error")
+            _roll_recurrences()
+        except Exception:
+            pass
+
+
+def _roll_recurrences():
+    step = {"daily": dt.timedelta(days=1), "weekly": dt.timedelta(weeks=1),
+            "hourly": dt.timedelta(hours=1)}
+    with SessionLocal() as s:
+        done = list(s.scalars(select(Campaign).where(
+            Campaign.recurrence != "",
+            Campaign.status.in_(("completed", "partially_failed")))))
+        for c in done:
+            delta = step.get(c.recurrence)
+            if not delta:
+                continue
+            nxt = (c.scheduled_at or c.completed_at or utcnow()) + delta
+            if c.recur_until and nxt > c.recur_until:
+                c.recurrence = ""
+                continue
+            exists = s.scalar(select(func.count()).select_from(Campaign).where(
+                Campaign.parent_id == c.id, Campaign.scheduled_at == nxt))
+            if exists:
+                continue
+            child = Campaign(
+                code=_next_code(s), name=c.name, body=c.body,
+                media_id=c.media_id, link_url=c.link_url, status="scheduled",
+                channel=c.channel, scheduled_at=nxt, recurrence=c.recurrence,
+                recur_until=c.recur_until, parent_id=c.id,
+                created_by=c.created_by, target_count=c.target_count)
+            s.add(child)
+            s.flush()
+            for gid in s.scalars(select(Delivery.group_id).where(
+                    Delivery.campaign_id == c.id)):
+                s.add(Delivery(campaign_id=child.id, group_id=gid))
+            c.recurrence = ""       # the child now carries the schedule
+        s.commit()
+
+
+def _next_code(s) -> str:
+    n = (s.scalar(select(func.count()).select_from(Campaign)) or 0) + 1
+    while s.scalar(select(func.count()).select_from(Campaign)
+                   .where(Campaign.code == f"CMP-{n:05d}")):
+        n += 1
+    return f"CMP-{n:05d}"
+
+
+# =============================================================== helpers
+def ok(**kw):
+    return JSONResponse(kw)
+
+
+async def body_json(request: Request) -> dict:
+    try:
+        return await request.json()
+    except Exception:
+        return {}
+
+
+# ================================================================== auth
+@app.post("/api/auth/login")
+async def login(request: Request):
+    data = await body_json(request)
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    with SessionLocal() as s:
+        user = s.scalar(select(User).where(User.email == email))
+    if not user or not user.active or not security.verify_password(
+            password, user.password_hash):
+        security.audit(None, "auth.failed", "user", email, "bad credentials",
+                       request)
+        raise HTTPException(401, "Invalid email or password")
+    token = security.create_session(user)
+    security.audit(user, "auth.login", "user", user.id, "", request)
+    resp = ok(token=token, user={"id": user.id, "email": user.email,
+                                 "name": user.name, "role": user.role,
+                                 "permissions": sorted(
+                                     config.PERMISSIONS.get(user.role, []))})
+    resp.set_cookie("wdap_session", token, httponly=True, samesite="lax",
+                    max_age=config.SESSION_TTL_HOURS * 3600)
+    return resp
+
+
+@app.post("/api/auth/logout")
+async def logout(request: Request):
+    token = request.cookies.get("wdap_session", "")
+    if token:
+        security.destroy_session(token)
+    resp = ok(ok=True)
+    resp.delete_cookie("wdap_session")
+    return resp
+
+
+@app.get("/api/auth/me")
+async def me(request: Request):
+    user = security.require_user(request)
+    return ok(user={"id": user.id, "email": user.email, "name": user.name,
+                    "role": user.role,
+                    "permissions": sorted(config.PERMISSIONS.get(user.role, []))})
+
+
+# ================================================================ system
+@app.get("/api/system")
+async def system(request: Request):
+    security.require_user(request)
+    return ok(
+        product="WhatsApp Dissemination & Analytics Platform",
+        stage="Proof of concept",
+        vendor="Gsure Technologies Private Limited",
+        default_channel=config.DEFAULT_CHANNEL,
+        time_scale=config.TIME_SCALE,
+        snapshot_intervals=[{"label": l, "nominal_seconds": s,
+                             "effective_seconds": round(config.scaled(s), 2)}
+                            for l, s in config.SNAPSHOT_INTERVALS],
+        rate=dispatcher.governor_state(),
+        daily=dispatcher.daily_usage(),
+        public_base_url=config.PUBLIC_BASE_URL,
+        channels=adapters.available(),
+    )
+
+
+@app.get("/api/channels")
+async def channels(request: Request):
+    security.require_user(request)
+    return ok(channels=adapters.available(), active=config.DEFAULT_CHANNEL)
+
+
+@app.get("/api/channels/{key}/health")
+async def channel_health(key: str, request: Request):
+    security.require_user(request)
+    try:
+        ad = adapters.get(key)
+    except Exception as exc:
+        raise HTTPException(404, str(exc))
+    return ok(health=await ad.health())
+
+
+@app.post("/api/channels/{key}/import-groups")
+async def channel_import(key: str, request: Request):
+    """Pull the real group list from a channel. Only the linked device route
+    can enumerate pre-existing groups."""
+    user = security.require(request, "group.write")
+    ad = adapters.get(key)
+    if key == "linked_device":
+        import receipts as receipts_mod
+        full = await ad.groups_full(refresh=True)
+        st = receipts_mod.apply_groups(full)
+        security.audit(user, "group.import", "channel", key,
+                       f"{st['added']} added, {st['updated']} updated", request)
+        return ok(discovered=len(full), added=st["added"], updated=st["updated"],
+                  members=st["members"])
+    refs = await ad.list_groups()
+    added = 0
+    with SessionLocal() as s:
+        for r in refs:
+            if s.scalar(select(Group).where(Group.wa_group_id == r.wa_group_id)):
+                continue
+            s.add(Group(wa_group_id=r.wa_group_id, name=r.name,
+                        member_count=r.member_count, source=r.source,
+                        category="Imported"))
+            added += 1
+        s.commit()
+    security.audit(user, "group.import", "channel", key, f"{added} added", request)
+    return ok(discovered=len(refs), added=added)
+
+
+@app.post("/api/settings/rate")
+async def set_rate(request: Request):
+    user = security.require(request, "settings.write")
+    d = await body_json(request)
+    dispatcher.set_rate(float(d.get("rate", config.SEND_RATE_PER_SEC)),
+                        float(d.get("jitter", config.SEND_JITTER_PCT)))
+    security.audit(user, "settings.rate", "governor", "",
+                   json.dumps(dispatcher.governor_state()), request)
+    return ok(**dispatcher.governor_state())
+
+
+# ================================================================ groups
+@app.get("/api/groups")
+async def list_groups(request: Request, q: str = "", category: str = "",
+                      folder: str = "", tag: str = "", active: str = "",
+                      source: str = "", page: int = 1, size: int = 50):
+    security.require(request, "group.read")
+    size = max(1, min(500, size))
+    with SessionLocal() as s:
+        stmt = select(Group)
+        if q:
+            like = f"%{q}%"
+            stmt = stmt.where(or_(Group.name.like(like),
+                                  Group.wa_group_id.like(like),
+                                  Group.region.like(like)))
+        if category:
+            stmt = stmt.where(Group.category == category)
+        if folder:
+            stmt = stmt.where(Group.folder == folder)
+        if tag:
+            stmt = stmt.where(Group.tags_json.like(f'%"{tag}"%'))
+        if active in ("true", "false"):
+            stmt = stmt.where(Group.active.is_(active == "true"))
+        if source:
+            stmt = stmt.where(Group.source == source)
+        total = s.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+        rows = list(s.scalars(stmt.order_by(Group.name)
+                              .offset((page - 1) * size).limit(size)))
+        return ok(total=total, page=page, size=size,
+                  items=[g.as_dict() for g in rows])
+
+
+_me_cache = {"jid": "", "at": 0.0}
+
+
+async def _me_jid() -> str:
+    """The linked account's own id, used to label its messages "You"."""
+    import time
+    if time.time() - _me_cache["at"] < 60:
+        return _me_cache["jid"]
+    h = await adapters.get("linked_device").health()
+    user = ((h.get("bridge") or {}).get("user") or {})
+    _me_cache.update(jid=user.get("id", ""), at=time.time())
+    return _me_cache["jid"]
+
+
+@app.get("/api/groups/sources")
+async def group_sources(request: Request):
+    security.require(request, "group.read")
+    with SessionLocal() as s:
+        rows = s.execute(select(Group.source, func.count())
+                         .group_by(Group.source)).all()
+    return ok(sources=[{"value": k, "count": v} for k, v in rows])
+
+
+@app.get("/api/groups/{gid}/insights")
+async def group_insights_route(gid: int, request: Request):
+    security.require(request, "analytics.read")
+    import group_insights
+    data = group_insights.insights(gid, await _me_jid())
+    if data is None:
+        raise HTTPException(404, "Group not found")
+    return ok(**data)
+
+
+@app.get("/api/groups/{gid}/messages")
+async def group_messages_route(gid: int, request: Request, before: str = "",
+                               limit: int = 50):
+    security.require(request, "analytics.read")
+    import group_insights
+    return ok(**group_insights.messages(gid, before or None, limit, await _me_jid()))
+
+
+@app.get("/api/messages/{msg_id}/receipts")
+async def message_receipts_route(msg_id: str, request: Request):
+    security.require(request, "analytics.read")
+    import group_insights
+    return ok(receipts=group_insights.receipts_for(msg_id, await _me_jid()))
+
+
+@app.post("/api/groups/{gid}/refresh")
+async def group_refresh(gid: int, request: Request):
+    """Pull this group's live profile and member list from the phone."""
+    user = security.require(request, "group.write")
+    import receipts as receipts_mod
+    with SessionLocal() as s:
+        g = s.get(Group, gid)
+        jid = g.wa_group_id if g else ""
+        src = g.source if g else ""
+    if src != "linked_device":
+        raise HTTPException(400, "Only groups imported from the linked account "
+                                 "have a live profile")
+    live = await adapters.get("linked_device").group(jid)
+    if not live:
+        raise HTTPException(502, "The linked account could not return this group")
+    st = receipts_mod.apply_groups([live])
+    security.audit(user, "group.refresh", "group", gid, "", request)
+    return ok(**st)
+
+
+@app.post("/api/groups/{gid}/history")
+async def group_history(gid: int, request: Request):
+    """Ask the phone for up to 50 older messages, paging back from the oldest
+    one already stored. Needs at least one stored message as an anchor."""
+    user = security.require(request, "group.write")
+    import group_insights
+    anchor = group_insights.oldest_anchor(gid)
+    if anchor is None:
+        raise HTTPException(409, "No message has been captured in this group yet, "
+                                 "so there is nothing to page back from. History "
+                                 "becomes available after the first new message.")
+    r = await adapters.get("linked_device").request_history(
+        anchor["jid"], anchor["id"], anchor["from_me"], anchor["ts_ms"], 50)
+    if not r.get("ok"):
+        raise HTTPException(502, r.get("error") or "History request failed")
+    security.audit(user, "group.history", "group", gid, "requested 50 older", request)
+    return ok(requested=True, anchor_ts=anchor["ts_ms"])
+
+
+@app.get("/api/chats")
+async def chat_list_route(request: Request, kind: str = ""):
+    """Groups and one to one conversations, most recently active first."""
+    security.require(request, "campaign.read")
+    import chats
+    me = await _me_jid()
+    return ok(chats=chats.chat_list(me, kind), me=bool(me),
+              can_send=can_perm(request, "campaign.execute"))
+
+
+@app.post("/api/chats/direct")
+async def open_direct_chat(request: Request):
+    """Open a one to one conversation. Checks the number with WhatsApp and
+    records the conversation; sends nothing."""
+    user = security.require(request, "campaign.execute")
+    import chats, messaging
+    d = await body_json(request)
+    try:
+        number = messaging.normalize_number(d.get("phone", ""))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if not await _me_jid():
+        raise HTTPException(409, "The WhatsApp bridge is not linked. Open Channels to check.")
+    chk = await adapters.get("linked_device").check_number(number)
+    if not chk.get("ok"):
+        raise HTTPException(502, "Could not verify the number: " + chk.get("error", "unknown"))
+    if not chk.get("exists"):
+        raise HTTPException(422, f"{messaging.pretty_number(number)} is not on WhatsApp.")
+    chat = chats.open_direct(number, (d.get("name") or "").strip())
+    security.audit(user, "chat.open", "individual", number, chat["name"], request)
+    return ok(chat=chat)
+
+
+@app.get("/api/chats/thread")
+async def chat_thread(request: Request, key: str = "", before: str = "", limit: int = 60):
+    """Messages of one conversation, newest first."""
+    security.require(request, "campaign.read")
+    import chats, group_insights
+    target = chats.resolve(key)
+    if target is None:
+        raise HTTPException(404, "Conversation not found.")
+    data = group_insights.thread_for_chat(target["jid"], before or None, limit, await _me_jid())
+    return ok(chat=target, **data)
+
+
+@app.post("/api/chats/send")
+async def chat_send(request: Request, key: str = Form(""), text: str = Form(""),
+                    reply_to: str = Form(""), file: UploadFile | None = File(None)):
+    """Composer send, for a group or a one to one conversation. Same send path
+    as the Messages view."""
+    user = security.require(request, "campaign.execute")
+    import chats
+    target = chats.resolve(key)
+    if target is None:
+        raise HTTPException(404, "Conversation not found.")
+    if target["kind"] == "group":
+        return ok(**await _send_message(request, user, kind="group", group_id=target["group_id"],
+                                        text=text, reply_to=reply_to, file=file))
+    return ok(**await _send_message(request, user, kind="individual", phone=target["number"],
+                                    name=target.get("raw_name", ""), text=text,
+                                    reply_to=reply_to, file=file))
+
+
+def can_perm(request: Request, perm: str) -> bool:
+    u = security.current_user(request)
+    return bool(u and perm in config.PERMISSIONS.get(u.role, set()))
+
+
+MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
+
+
+def _render_placeholders(text: str, *, name: str = "", group_name: str = "") -> str:
+    """Fill the template placeholders that make sense for a direct message.
+    Campaign only placeholders are removed rather than sent literally."""
+    import re
+    text = (text or "").replace("{{name}}", name or "there").replace("{{group_name}}", group_name or "")
+    text = text.replace("{{campaign_name}}", "")
+    text = re.sub(r"[ \t]*\{\{link\}\}[ \t]*", "", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+async def _send_message(request: Request, user, *, kind: str, group_id: int | None = None,
+                        phone: str = "", name: str = "", text: str = "", reply_to: str = "",
+                        template_id: int | None = None, file: UploadFile | None = None) -> dict:
+    """The one send path for operator messages, group or individual. Campaign
+    despatch has its own path through the dispatcher and rate governor."""
+    import chats
+    import messaging
+    if kind not in ("group", "individual"):
+        raise HTTPException(400, "Message type must be group or individual.")
+    text = (text or "").strip()
+    if not text and template_id:
+        with SessionLocal() as s:
+            t = s.get(Template, int(template_id))
+            if t is None:
+                raise HTTPException(404, "Template not found.")
+            text = t.body or ""
+    if not text and file is None:
+        raise HTTPException(400, "Type a message, choose a template or attach a file.")
+    if len(text) > 4096:
+        raise HTTPException(400, "Messages are limited to 4,096 characters.")
+
+    me = await _me_jid()
+    if not me:
+        raise HTTPException(409, "The WhatsApp bridge is not linked. Open Channels to check.")
+    adapter = adapters.get("linked_device")
+
+    # ---- resolve the recipient ------------------------------------------
+    group_name, number, recipient_total = "", "", 1
+    if kind == "group":
+        with SessionLocal() as s:
+            g = s.get(Group, int(group_id or 0))
+            if g is None:
+                raise HTTPException(404, "Group not found.")
+            if g.source != "linked_device":
+                raise HTTPException(400, "This is a demo group with no WhatsApp counterpart. "
+                                         "Only live groups can receive messages.")
+            jid, group_name = g.wa_group_id, g.name
+            recipient_total = max(0, (g.member_count or 0) - 1)
+        allowed, why = chats.can_send(group_id, me)
+        if not allowed:
+            raise HTTPException(403, why)
+    else:
+        try:
+            number = messaging.normalize_number(phone)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        jid = f"{number}@s.whatsapp.net"
+
+    text = _render_placeholders(text, name=name, group_name=group_name)
+
+    reason = chats.throttle_check()
+    if reason:
+        raise HTTPException(429, reason)
+    if not dispatcher._check_daily_ceiling():
+        raise HTTPException(429, "The daily send ceiling has been reached.")
+
+    common = dict(chat_type=kind, group_id=group_id if kind == "group" else None, me_jid=me,
+                  recipient_total=recipient_total, peer_name=name if kind == "individual" else "",
+                  peer_number=number)
+
+    if kind == "individual":
+        chk = await adapter.check_number(number)
+        if not chk.get("ok"):
+            raise HTTPException(502, "Could not verify the number: " + chk.get("error", "unknown"))
+        if not chk.get("exists"):
+            mid = messaging.record_failed(chat_jid=jid, text=text, mtype="conversation",
+                                          error="This number is not on WhatsApp.", **common)
+            security.audit(user, "message.send.failed", "individual", number, "not on WhatsApp", request)
+            raise HTTPException(422, f"{messaging.pretty_number(number)} is not on WhatsApp. "
+                                     f"Recorded as failed ({mid}).")
+        jid = chk.get("jid") or jid
+
+    quoted = None
+    if reply_to:
+        with SessionLocal() as s:
+            from db import WaMessage
+            q = s.scalar(select(WaMessage).where(WaMessage.msg_id == reply_to))
+            if q is not None:
+                quoted = {"id": q.msg_id, "from_me": q.from_me,
+                          "participant": q.sender_jid, "text": q.text[:500]}
+
+    media_path = mime = fname = None
+    mtype = "conversation"
+    if file is not None:
+        data = await file.read()
+        if len(data) > MAX_ATTACHMENT_BYTES:
+            raise HTTPException(413, "Attachments are limited to 64 MB.")
+        fname = "".join(ch for ch in (file.filename or "file")
+                        if ch.isalnum() or ch in "._- ")[:120] or "file"
+        stored = config.MEDIA_DIR / f"{secrets.token_hex(8)}_{fname}"
+        stored.write_bytes(data)
+        media_path, mime = str(stored), file.content_type or "application/octet-stream"
+        mtype = ("image" if mime.startswith("image") else "video" if mime.startswith("video")
+                 else "audio" if mime.startswith("audio") else "document")
+        with SessionLocal() as s:
+            s.add(Media(filename=fname, mime=mime, size_bytes=len(data),
+                        stored_path=media_path, kind=mtype, tracked=False))
+            s.commit()
+
+    chats.throttle_record()
+    r = await adapter.send_chat(jid=jid, text=text, media_path=media_path, media_mime=mime,
+                                file_name=fname, quoted=quoted)
+    shown = text or (fname or "")
+    if not r.get("ok"):
+        mid = messaging.record_failed(chat_jid=jid, text=shown, mtype=mtype,
+                                      error=r.get("error", "unknown"), **common)
+        security.audit(user, "message.send.failed", kind, group_id or number,
+                       r.get("error", "")[:200], request)
+        raise HTTPException(502, "WhatsApp did not accept the message: " + r.get("error", "unknown"))
+
+    messaging.record_sent(chat_jid=jid, msg_id=r.get("id", ""), text=shown, mtype=mtype,
+                          quoted_id=quoted["id"] if quoted else "", **common)
+    security.audit(user, "message.send", kind, group_id or number,
+                   f"{mtype}, {len(text)} chars" + (", reply" if quoted else ""), request)
+    return {"sent": True, "msg_id": r.get("id", ""), "status": "pending", "type": kind}
+
+
+@app.post("/api/groups/{gid}/send")
+async def group_send(gid: int, request: Request, text: str = Form(""),
+                     reply_to: str = Form(""), file: UploadFile | None = File(None)):
+    """Group chat composer. Same send path as the Messages view."""
+    user = security.require(request, "campaign.execute")
+    return ok(**await _send_message(request, user, kind="group", group_id=gid, text=text,
+                                    reply_to=reply_to, file=file))
+
+
+@app.post("/api/messages/send")
+async def message_send(request: Request, type: str = Form("group"), group_id: int = Form(0),
+                       phone: str = Form(""), name: str = Form(""), text: str = Form(""),
+                       template_id: int = Form(0), reply_to: str = Form(""),
+                       file: UploadFile | None = File(None)):
+    """Send to a group or to one person."""
+    user = security.require(request, "campaign.execute")
+    return ok(**await _send_message(request, user, kind=type, group_id=group_id or None,
+                                    phone=phone, name=name.strip()[:160], text=text,
+                                    reply_to=reply_to, template_id=template_id or None, file=file))
+
+
+@app.get("/api/messages")
+async def message_list(request: Request, type: str = "", status: str = "", q: str = "",
+                       source: str = "", page: int = 1, size: int = 25):
+    """Sent message history, group and individual, newest first."""
+    security.require(request, "analytics.read")
+    import messaging
+    return ok(**messaging.list_messages(type, status, q, source, page, size))
+
+
+@app.get("/api/messages/{msg_id}/details")
+async def message_details_route(msg_id: str, request: Request):
+    """Delivery metadata for one message, with recipient level status."""
+    security.require(request, "analytics.read")
+    import messaging
+    d = messaging.message_details(msg_id, await _me_jid())
+    if d is None:
+        raise HTTPException(404, "Message not found.")
+    return ok(**d)
+
+
+@app.get("/api/nav-counts")
+async def nav_counts(request: Request):
+    user = security.require_user(request)
+    since = utcnow() - dt.timedelta(hours=24)
+    from db import WaMessage
+    with SessionLocal() as s:
+        live = s.scalar(select(func.count()).select_from(Group)
+                        .where(Group.source == "linked_device")) or 0
+        active = s.scalar(select(func.count(func.distinct(WaMessage.group_id)))
+                          .where(WaMessage.ts >= since)) or 0
+        camps = s.scalar(select(func.count()).select_from(Campaign)) or 0
+        running = s.scalar(select(func.count()).select_from(Campaign)
+                           .where(Campaign.status.in_(("running", "paused")))) or 0
+        users = s.scalar(select(func.count()).select_from(User)) or 0
+    perms = config.PERMISSIONS.get(user.role, set())
+    return ok(groups=live, chats=active, campaigns=camps, running=running,
+              users=users if "user.read" in perms else None)
+
+
+@app.get("/api/groups/{gid}/members")
+async def group_members_route(gid: int, request: Request):
+    security.require(request, "analytics.read")
+    import group_insights
+    return ok(members=group_insights.members(gid, await _me_jid()))
+
+
+@app.get("/api/users/brief")
+async def users_brief(request: Request):
+    """Names and initials for the header avatar stack."""
+    security.require_user(request)
+    with SessionLocal() as s:
+        rows = list(s.scalars(select(User).where(User.active.is_(True)).order_by(User.id)))
+    return ok(users=[{"name": u.name, "role": u.role} for u in rows])
+
+
+@app.get("/api/groups/facets")
+async def group_facets(request: Request):
+    security.require(request, "group.read")
+    with SessionLocal() as s:
+        cats = [{"value": c, "count": n} for c, n in s.execute(
+            select(Group.category, func.count()).group_by(Group.category)
+            .order_by(func.count().desc())).all() if c]
+        folders = [{"value": f, "count": n} for f, n in s.execute(
+            select(Group.folder, func.count()).group_by(Group.folder)
+            .order_by(func.count().desc())).all() if f]
+        tags: dict[str, int] = {}
+        for (tj,) in s.execute(select(Group.tags_json)).all():
+            try:
+                for t in json.loads(tj or "[]"):
+                    tags[t] = tags.get(t, 0) + 1
+            except Exception:
+                pass
+        total = s.scalar(select(func.count()).select_from(Group)) or 0
+    return ok(categories=cats, folders=folders,
+              tags=[{"value": k, "count": v} for k, v in
+                    sorted(tags.items(), key=lambda kv: -kv[1])],
+              total=total)
+
+
+@app.post("/api/groups")
+async def create_group(request: Request):
+    user = security.require(request, "group.write")
+    d = await body_json(request)
+    with SessionLocal() as s:
+        g = Group(wa_group_id=d.get("wa_group_id") or f"manual-{secrets.token_hex(6)}",
+                  name=d.get("name", "Untitled group"),
+                  category=d.get("category", ""), folder=d.get("folder", ""),
+                  tags_json=json.dumps(d.get("tags", [])),
+                  member_count=int(d.get("member_count", 0) or 0),
+                  region=d.get("region", ""), source="manual")
+        s.add(g)
+        s.commit()
+        out = g.as_dict()
+    security.audit(user, "group.create", "group", out["id"], out["name"], request)
+    return ok(group=out)
+
+
+@app.patch("/api/groups/{gid}")
+async def update_group(gid: int, request: Request):
+    user = security.require(request, "group.write")
+    d = await body_json(request)
+    with SessionLocal() as s:
+        g = s.get(Group, gid)
+        if not g:
+            raise HTTPException(404, "Group not found")
+        for f in ("name", "category", "folder", "region"):
+            if f in d:
+                setattr(g, f, d[f])
+        if "tags" in d:
+            g.tags_json = json.dumps(d["tags"])
+        if "active" in d:
+            g.active = bool(d["active"])
+        if "member_count" in d:
+            g.member_count = int(d["member_count"] or 0)
+        s.commit()
+        out = g.as_dict()
+    security.audit(user, "group.update", "group", gid, "", request)
+    return ok(group=out)
+
+
+@app.post("/api/groups/bulk")
+async def bulk_groups(request: Request):
+    """Apply a category, folder or tag to many groups at once (FR-08, FR-10)."""
+    user = security.require(request, "group.write")
+    d = await body_json(request)
+    ids = d.get("ids") or []
+    if not ids:
+        raise HTTPException(400, "No group ids supplied")
+    with SessionLocal() as s:
+        rows = list(s.scalars(select(Group).where(Group.id.in_(ids))))
+        for g in rows:
+            if d.get("category") is not None:
+                g.category = d["category"]
+            if d.get("folder") is not None:
+                g.folder = d["folder"]
+            if d.get("active") is not None:
+                g.active = bool(d["active"])
+            if d.get("add_tag"):
+                t = g.tags
+                if d["add_tag"] not in t:
+                    t.append(d["add_tag"])
+                    g.tags_json = json.dumps(t)
+            if d.get("remove_tag"):
+                t = [x for x in g.tags if x != d["remove_tag"]]
+                g.tags_json = json.dumps(t)
+        s.commit()
+        n = len(rows)
+    security.audit(user, "group.bulk", "group", "", f"{n} groups", request)
+    return ok(updated=n)
+
+
+@app.post("/api/groups/import")
+async def import_groups(request: Request, file: UploadFile = File(...)):
+    """CSV import. Columns: wa_group_id,name,category,folder,tags,member_count,region"""
+    user = security.require(request, "group.write")
+    raw = (await file.read()).decode("utf-8-sig", errors="replace")
+    rdr = csv.DictReader(io.StringIO(raw))
+    added = updated = skipped = 0
+    with SessionLocal() as s:
+        for row in rdr:
+            wid = (row.get("wa_group_id") or "").strip()
+            name = (row.get("name") or "").strip()
+            if not wid and not name:
+                skipped += 1
+                continue
+            if not wid:
+                wid = "csv-" + secrets.token_hex(6)
+            tags = [t.strip() for t in (row.get("tags") or "").split("|") if t.strip()]
+            g = s.scalar(select(Group).where(Group.wa_group_id == wid))
+            if g:
+                g.name = name or g.name
+                g.category = (row.get("category") or g.category).strip()
+                g.folder = (row.get("folder") or g.folder).strip()
+                if tags:
+                    g.tags_json = json.dumps(tags)
+                updated += 1
+            else:
+                s.add(Group(wa_group_id=wid, name=name or wid,
+                            category=(row.get("category") or "").strip(),
+                            folder=(row.get("folder") or "").strip(),
+                            tags_json=json.dumps(tags),
+                            member_count=int(row.get("member_count") or 0),
+                            region=(row.get("region") or "").strip(),
+                            source="csv"))
+                added += 1
+        s.commit()
+    security.audit(user, "group.import.csv", "group", "",
+                   f"added {added}, updated {updated}", request)
+    return ok(added=added, updated=updated, skipped=skipped)
+
+
+# ----------------------------------------------------------- saved lists
+@app.get("/api/lists")
+async def get_lists(request: Request):
+    security.require(request, "group.read")
+    with SessionLocal() as s:
+        out = []
+        for l in s.scalars(select(GroupList).order_by(GroupList.name)):
+            n = s.scalar(select(func.count()).select_from(GroupListMember)
+                         .where(GroupListMember.list_id == l.id)) or 0
+            out.append({"id": l.id, "name": l.name,
+                        "description": l.description, "count": n})
+    return ok(lists=out)
+
+
+@app.post("/api/lists")
+async def create_list(request: Request):
+    user = security.require(request, "group.write")
+    d = await body_json(request)
+    name = (d.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "List name is required")
+    ids = d.get("group_ids") or []
+    with SessionLocal() as s:
+        if s.scalar(select(GroupList).where(GroupList.name == name)):
+            raise HTTPException(409, "A list with that name already exists")
+        l = GroupList(name=name, description=d.get("description", ""))
+        s.add(l)
+        s.flush()
+        for gid in ids:
+            s.add(GroupListMember(list_id=l.id, group_id=int(gid)))
+        s.commit()
+        lid, cnt = l.id, len(ids)
+    security.audit(user, "list.create", "list", lid, f"{cnt} groups", request)
+    return ok(id=lid, count=cnt)
+
+
+@app.get("/api/lists/{lid}/groups")
+async def list_groups_of(lid: int, request: Request):
+    security.require(request, "group.read")
+    with SessionLocal() as s:
+        ids = [m.group_id for m in s.scalars(
+            select(GroupListMember).where(GroupListMember.list_id == lid))]
+    return ok(group_ids=ids, count=len(ids))
+
+
+# ============================================================= templates
+@app.get("/api/templates")
+async def get_templates(request: Request):
+    security.require(request, "campaign.read")
+    with SessionLocal() as s:
+        return ok(templates=[t.as_dict() for t in s.scalars(select(Template))])
+
+
+@app.post("/api/templates")
+async def create_template(request: Request):
+    user = security.require(request, "template.write")
+    d = await body_json(request)
+    with SessionLocal() as s:
+        if s.scalar(select(Template).where(Template.name == d.get("name"))):
+            raise HTTPException(409, "Template name already exists")
+        t = Template(name=d.get("name", "Untitled"), body=d.get("body", ""),
+                     media_id=d.get("media_id"))
+        s.add(t)
+        s.commit()
+        out = t.as_dict()
+    security.audit(user, "template.create", "template", out["id"], out["name"],
+                   request)
+    return ok(template=out)
+
+
+# ================================================================= media
+@app.post("/api/media")
+async def upload_media(request: Request, file: UploadFile = File(...),
+                       tracked: str = Form("true")):
+    user = security.require(request, "campaign.write")
+    data = await file.read()
+    safe = "".join(c for c in (file.filename or "upload")
+                   if c.isalnum() or c in "._- ")[:120] or "upload"
+    stored = config.MEDIA_DIR / f"{secrets.token_hex(8)}_{safe}"
+    stored.write_bytes(data)
+    mime = file.content_type or "application/octet-stream"
+    kind = ("image" if mime.startswith("image") else
+            "video" if mime.startswith("video") else
+            "audio" if mime.startswith("audio") else "document")
+    with SessionLocal() as s:
+        m = Media(filename=safe, mime=mime, size_bytes=len(data),
+                  stored_path=str(stored), kind=kind,
+                  tracked=(tracked or "true").lower() == "true")
+        s.add(m)
+        s.commit()
+        out = m.as_dict()
+    security.audit(user, "media.upload", "media", out["id"],
+                   f"{safe} {len(data)} bytes", request)
+    return ok(media=out)
+
+
+@app.get("/api/media")
+async def list_media(request: Request):
+    security.require(request, "campaign.read")
+    with SessionLocal() as s:
+        return ok(media=[m.as_dict() for m in s.scalars(
+            select(Media).order_by(Media.id.desc()).limit(100))])
+
+
+# ============================================================= campaigns
+@app.get("/api/campaigns")
+async def list_campaigns(request: Request, status: str = "", q: str = "",
+                         page: int = 1, size: int = 25):
+    security.require(request, "campaign.read")
+    with SessionLocal() as s:
+        stmt = select(Campaign)
+        if status:
+            stmt = stmt.where(Campaign.status == status)
+        if q:
+            stmt = stmt.where(or_(Campaign.name.like(f"%{q}%"),
+                                  Campaign.code.like(f"%{q}%")))
+        total = s.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+        rows = list(s.scalars(stmt.order_by(Campaign.id.desc())
+                              .offset((page - 1) * size).limit(size)))
+        items = []
+        for c in rows:
+            counts = {k: v for k, v in s.execute(
+                select(Delivery.status, func.count())
+                .where(Delivery.campaign_id == c.id)
+                .group_by(Delivery.status)).all()}
+            items.append({
+                "id": c.id, "code": c.code, "name": c.name,
+                "status": c.status, "channel": c.channel,
+                "targets": c.target_count,
+                "reached": counts.get("delivered", 0) + counts.get("read", 0),
+                "failed": counts.get("failed", 0),
+                "pending": counts.get("queued", 0) + counts.get("sent", 0),
+                "created_at": c.created_at.isoformat(),
+                "scheduled_at": c.scheduled_at.isoformat() if c.scheduled_at else None,
+                "recurrence": c.recurrence,
+                "body_preview": (c.body or "")[:140],
+                "media_id": c.media_id,
+            })
+    return ok(total=total, items=items)
+
+
+@app.post("/api/campaigns")
+async def create_campaign(request: Request):
+    """Compose, target and optionally schedule. Targeting accepts explicit
+    group ids, a saved list, or a category / folder / tag filter."""
+    user = security.require(request, "campaign.write")
+    d = await body_json(request)
+    name = (d.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "Campaign name is required")
+    body = d.get("body") or ""
+    if not body.strip() and not d.get("media_id"):
+        raise HTTPException(400, "A campaign needs a message body or media")
+
+    with SessionLocal() as s:
+        gids: list[int] = []
+        if d.get("group_ids"):
+            gids = [int(x) for x in d["group_ids"]]
+        elif d.get("list_id"):
+            gids = [m.group_id for m in s.scalars(select(GroupListMember)
+                    .where(GroupListMember.list_id == int(d["list_id"])))]
+        else:
+            stmt = select(Group.id).where(Group.active.is_(True))
+            if d.get("category"):
+                stmt = stmt.where(Group.category == d["category"])
+            if d.get("folder"):
+                stmt = stmt.where(Group.folder == d["folder"])
+            if d.get("tag"):
+                stmt = stmt.where(Group.tags_json.like(f'%"{d["tag"]}"%'))
+            gids = list(s.scalars(stmt))
+        gids = sorted(set(gids))
+        if not gids:
+            raise HTTPException(400, "Targeting matched no groups")
+
+        sched = None
+        if d.get("scheduled_at"):
+            try:
+                sched = dt.datetime.fromisoformat(
+                    d["scheduled_at"].replace("Z", ""))
+            except Exception:
+                raise HTTPException(400, "scheduled_at must be ISO 8601")
+
+        c = Campaign(
+            code=_next_code(s), name=name, body=body,
+            media_id=d.get("media_id"), link_url=(d.get("link_url") or "").strip(),
+            channel=d.get("channel") or config.DEFAULT_CHANNEL,
+            status="scheduled" if sched else "draft",
+            scheduled_at=sched, recurrence=(d.get("recurrence") or ""),
+            created_by=user.id, target_count=len(gids))
+        s.add(c)
+        s.flush()
+        s.add_all([Delivery(campaign_id=c.id, group_id=g) for g in gids])
+        s.commit()
+        cid, code = c.id, c.code
+    security.audit(user, "campaign.create", "campaign", cid,
+                   f"{name} -> {len(gids)} groups", request)
+    dispatcher.log(cid, f"Campaign {code} created with {len(gids)} targets.")
+    return ok(id=cid, code=code, targets=len(gids))
+
+
+@app.get("/api/campaigns/{cid}")
+async def get_campaign(cid: int, request: Request):
+    security.require(request, "campaign.read")
+    with SessionLocal() as s:
+        c = s.get(Campaign, cid)
+        if not c:
+            raise HTTPException(404, "Campaign not found")
+        media = s.get(Media, c.media_id) if c.media_id else None
+        sample_group = s.scalar(select(Group).join(
+            Delivery, Delivery.group_id == Group.id).where(
+            Delivery.campaign_id == cid).limit(1))
+        creator = s.get(User, c.created_by) if c.created_by else None
+    preview = c.body or ""
+    if sample_group:
+        preview = dispatcher.render_body(c, sample_group, "SAMPLETOKEN",
+                                         make_media_token(cid, sample_group.id,
+                                                          c.media_id)
+                                         if (media and media.tracked) else None)
+    return ok(campaign={
+        "id": c.id, "code": c.code, "name": c.name, "body": c.body,
+        "status": c.status, "channel": c.channel, "link_url": c.link_url,
+        "targets": c.target_count, "recurrence": c.recurrence,
+        "created_at": c.created_at.isoformat(),
+        "created_by": creator.name if creator else "",
+        "scheduled_at": c.scheduled_at.isoformat() if c.scheduled_at else None,
+        "started_at": c.started_at.isoformat() if c.started_at else None,
+        "completed_at": c.completed_at.isoformat() if c.completed_at else None,
+        "media": media.as_dict() if media else None,
+        "rendered_preview": preview,
+    }, runtime=dispatcher.runtime_state(cid))
+
+
+@app.post("/api/campaigns/{cid}/launch")
+async def launch_campaign(cid: int, request: Request):
+    user = security.require(request, "campaign.execute")
+    try:
+        await dispatcher.launch(cid)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    security.audit(user, "campaign.launch", "campaign", cid, "", request)
+    return ok(started=True)
+
+
+@app.post("/api/campaigns/{cid}/{action}")
+async def campaign_action(cid: int, action: str, request: Request):
+    user = security.require(request, "campaign.execute")
+    if action == "pause":
+        dispatcher.pause(cid)
+    elif action == "resume":
+        dispatcher.resume(cid)
+    elif action == "cancel":
+        dispatcher.cancel(cid)
+    elif action == "retry-failed":
+        with SessionLocal() as s:
+            rows = list(s.scalars(select(Delivery).where(
+                Delivery.campaign_id == cid, Delivery.status == "failed")))
+            for d in rows:
+                d.status, d.attempts = "queued", 0
+            c = s.get(Campaign, cid)
+            if c:
+                c.status = "draft"
+            s.commit()
+            n = len(rows)
+        dispatcher.log(cid, f"Requeued {n} failed deliveries for retry.")
+        await dispatcher.launch(cid)
+    elif action == "snapshot-now":
+        for label, _ in config.SNAPSHOT_INTERVALS:
+            analytics.take_snapshot(cid, label)
+    else:
+        raise HTTPException(404, "Unknown action")
+    security.audit(user, f"campaign.{action}", "campaign", cid, "", request)
+    return ok(ok=True, action=action)
+
+
+@app.get("/api/campaigns/{cid}/deliveries")
+async def campaign_deliveries(cid: int, request: Request, status: str = "",
+                              page: int = 1, size: int = 100):
+    security.require(request, "campaign.read")
+    with SessionLocal() as s:
+        stmt = (select(Delivery, Group)
+                .join(Group, Group.id == Delivery.group_id)
+                .where(Delivery.campaign_id == cid))
+        if status:
+            stmt = stmt.where(Delivery.status == status)
+        total = s.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+        rows = list(s.execute(stmt.order_by(Delivery.id)
+                              .offset((page - 1) * size).limit(size)).all())
+        items = [{
+            "group": g.name, "group_id": g.id, "category": g.category,
+            "members": g.member_count, "status": d.status,
+            "attempts": d.attempts, "member_reads": d.read_count,
+            "message_id": d.provider_message_id,
+            "error_code": d.error_code, "error": d.error_title,
+            "sent_at": d.sent_at.isoformat() if d.sent_at else None,
+            "delivered_at": d.delivered_at.isoformat() if d.delivered_at else None,
+            "read_at": d.read_at.isoformat() if d.read_at else None,
+        } for d, g in rows]
+    return ok(total=total, items=items)
+
+
+@app.delete("/api/campaigns/{cid}")
+async def delete_campaign(cid: int, request: Request):
+    user = security.require(request, "campaign.write")
+    with SessionLocal() as s:
+        c = s.get(Campaign, cid)
+        if not c:
+            raise HTTPException(404, "Campaign not found")
+        if c.status == "running":
+            raise HTTPException(409, "Pause or cancel the campaign first")
+        for model in (Delivery, TrackedLink, LinkEvent, MediaEvent, Interaction,
+                      EventLog):
+            s.execute(sqldelete(model).where(model.campaign_id == cid))
+        from db import Snapshot
+        s.execute(sqldelete(Snapshot).where(Snapshot.campaign_id == cid))
+        s.delete(c)
+        s.commit()
+    security.audit(user, "campaign.delete", "campaign", cid, "", request)
+    return ok(deleted=True)
+
+
+# ============================================================= analytics
+@app.get("/api/campaigns/{cid}/analytics")
+async def campaign_analytics(cid: int, request: Request):
+    security.require(request, "analytics.read")
+    return ok(metrics=analytics.campaign_metrics(cid),
+              snapshots=analytics.snapshots_for(cid),
+              schedule=analytics.snapshot_schedule(cid),
+              timeseries=analytics.timeseries(cid))
+
+
+@app.get("/api/campaigns/{cid}/groups")
+async def campaign_groups(cid: int, request: Request, limit: int = 200):
+    security.require(request, "analytics.read")
+    return ok(groups=analytics.group_performance(cid, limit=limit))
+
+
+@app.get("/api/dashboard")
+async def dashboard(request: Request, days: int = 14):
+    security.require(request, "analytics.read")
+    days = max(7, min(90, days))
+    with SessionLocal() as s:
+        recent = list(s.scalars(select(Campaign)
+                                .order_by(Campaign.id.desc()).limit(6)))
+        items = []
+        for c in recent:
+            counts = dict(s.execute(select(Delivery.status, func.count())
+                                    .where(Delivery.campaign_id == c.id)
+                                    .group_by(Delivery.status)).all())
+            reached = counts.get("delivered", 0) + counts.get("read", 0)
+            items.append({"id": c.id, "code": c.code, "name": c.name,
+                          "status": c.status, "targets": c.target_count,
+                          "reached": reached, "read": counts.get("read", 0),
+                          "failed": counts.get("failed", 0), "channel": c.channel,
+                          "created_at": c.created_at.isoformat()})
+        live = s.execute(select(func.count(), func.coalesce(func.sum(Group.member_count), 0))
+                         .where(Group.source == "linked_device")).one()
+    by_date = analytics.date_summary(days)
+    since = utcnow() - dt.timedelta(days=days)
+    with SessionLocal() as s:
+        reached_by_day = dict(s.execute(
+            select(func.date(Delivery.sent_at), func.count())
+            .where(Delivery.sent_at >= since, Delivery.status.in_(("delivered", "read")))
+            .group_by(func.date(Delivery.sent_at))).all())
+    # zero fill so a step chart has one bucket per day
+    have = {d["date"]: d for d in by_date}
+    today = utcnow().date()
+    filled = []
+    for i in range(days - 1, -1, -1):
+        day = (today - dt.timedelta(days=i)).isoformat()
+        row = dict(have.get(day, {"date": day, "campaigns": 0, "targets": 0}))
+        row["reached"] = int(reached_by_day.get(day, 0))
+        filled.append(row)
+    bridge = await adapters.get("linked_device").health()
+    b = bridge.get("bridge") or {}
+    return ok(summary=analytics.portfolio_summary(), recent=items, by_date=filled,
+              live={"groups": live[0], "members": int(live[1]),
+                    "linked": bool(b.get("connected")),
+                    "account": (b.get("user") or {}).get("name", "")},
+              rate=dispatcher.governor_state(), daily=dispatcher.daily_usage(),
+              days=days)
+
+
+@app.get("/api/events")
+async def events(request: Request, campaign_id: int = 0, after: int = 0,
+                 limit: int = 120):
+    """Real time operational log (FR-25)."""
+    security.require(request, "campaign.read")
+    with SessionLocal() as s:
+        stmt = select(EventLog).where(EventLog.id > after)
+        if campaign_id:
+            stmt = stmt.where(EventLog.campaign_id == campaign_id)
+        rows = list(s.scalars(stmt.order_by(EventLog.id.desc()).limit(limit)))
+    rows.reverse()
+    return ok(events=[{"id": e.id, "ts": e.ts.isoformat(), "level": e.level,
+                       "campaign_id": e.campaign_id, "message": e.message}
+                      for e in rows])
+
+
+# =============================================================== reports
+def _attach(content: bytes, filename: str, mime: str) -> Response:
+    return Response(content, media_type=mime, headers={
+        "Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.get("/api/reports/campaign/{cid}.{fmt}")
+async def campaign_report(cid: int, fmt: str, request: Request):
+    user = security.require(request, "report.export")
+    sheets = reports.campaign_sheets(cid)
+    with SessionLocal() as s:
+        c = s.get(Campaign, cid)
+    code = c.code if c else f"campaign-{cid}"
+    security.audit(user, "report.export", "campaign", cid, fmt, request)
+    if fmt == "csv":
+        h, r = sheets["Per group log"]
+        return _attach(reports.to_csv(h, r), f"{code}-per-group.csv", "text/csv")
+    if fmt == "xlsx":
+        return _attach(reports.to_xlsx(sheets), f"{code}-report.xlsx",
+                       "application/vnd.openxmlformats-officedocument."
+                       "spreadsheetml.sheet")
+    if fmt == "pdf":
+        return _attach(reports.campaign_pdf(cid), f"{code}-report.pdf",
+                       "application/pdf")
+    raise HTTPException(404, "Format must be csv, xlsx or pdf")
+
+
+@app.get("/api/reports/groups.{fmt}")
+async def groups_report(fmt: str, request: Request):
+    user = security.require(request, "report.export")
+    sheets = reports.groups_sheets()
+    security.audit(user, "report.export", "groups", "", fmt, request)
+    if fmt == "csv":
+        h, r = sheets["Groups"]
+        return _attach(reports.to_csv(h, r), "groups.csv", "text/csv")
+    if fmt == "xlsx":
+        return _attach(reports.to_xlsx(sheets), "groups.xlsx",
+                       "application/vnd.openxmlformats-officedocument."
+                       "spreadsheetml.sheet")
+    raise HTTPException(404, "Format must be csv or xlsx")
+
+
+# ================================================================= users
+@app.get("/api/users")
+async def list_users(request: Request):
+    security.require(request, "user.read")
+    with SessionLocal() as s:
+        rows = list(s.scalars(select(User).order_by(User.id)))
+    return ok(users=[{"id": u.id, "email": u.email, "name": u.name,
+                      "role": u.role, "active": u.active,
+                      "last_login": u.last_login.isoformat() if u.last_login else None}
+                     for u in rows], roles=config.ROLES,
+              permissions={r: sorted(p) for r, p in config.PERMISSIONS.items()})
+
+
+@app.post("/api/users")
+async def create_user(request: Request):
+    user = security.require(request, "user.write")
+    d = await body_json(request)
+    email = (d.get("email") or "").strip().lower()
+    if not email or not d.get("password"):
+        raise HTTPException(400, "Email and password are required")
+    if d.get("role") not in config.ROLES:
+        raise HTTPException(400, f"Role must be one of {config.ROLES}")
+    with SessionLocal() as s:
+        if s.scalar(select(User).where(User.email == email)):
+            raise HTTPException(409, "That email already exists")
+        u = User(email=email, name=d.get("name", email), role=d["role"],
+                 password_hash=security.hash_password(d["password"]))
+        s.add(u)
+        s.commit()
+        uid = u.id
+    security.audit(user, "user.create", "user", uid, f"{email} {d['role']}",
+                   request)
+    return ok(id=uid)
+
+
+@app.patch("/api/users/{uid}")
+async def update_user(uid: int, request: Request):
+    user = security.require(request, "user.write")
+    d = await body_json(request)
+    with SessionLocal() as s:
+        u = s.get(User, uid)
+        if not u:
+            raise HTTPException(404, "User not found")
+        if "role" in d and d["role"] in config.ROLES:
+            u.role = d["role"]
+        if "active" in d:
+            u.active = bool(d["active"])
+        if "name" in d:
+            u.name = d["name"]
+        if d.get("password"):
+            u.password_hash = security.hash_password(d["password"])
+        s.commit()
+    security.audit(user, "user.update", "user", uid, "", request)
+    return ok(ok=True)
+
+
+@app.get("/api/audit")
+async def audit_log(request: Request, limit: int = 200):
+    security.require(request, "audit.read")
+    with SessionLocal() as s:
+        rows = list(s.scalars(select(AuditLog)
+                              .order_by(AuditLog.id.desc()).limit(limit)))
+    return ok(entries=[{"id": a.id, "ts": a.ts.isoformat(), "actor": a.actor,
+                        "action": a.action, "entity": a.entity,
+                        "entity_id": a.entity_id, "detail": a.detail,
+                        "ip": a.ip} for a in rows])
+
+
+# ====================================================== tracking endpoints
+@app.get("/t/{token}")
+async def tracked_link(token: str, request: Request):
+    """Per group tracked short link. This is metric M4: the click is
+    attributable to an individual group because the token is unique to the
+    (campaign, group) pair."""
+    with SessionLocal() as s:
+        link = s.scalar(select(TrackedLink).where(TrackedLink.token == token))
+        if not link:
+            raise HTTPException(404, "Unknown link")
+        vh = security.hash_visitor(
+            request.client.host if request.client else "",
+            request.headers.get("user-agent", ""))
+        seen = s.scalar(select(func.count()).select_from(LinkEvent).where(
+            LinkEvent.link_id == link.id, LinkEvent.visitor_hash == vh)) or 0
+        link.clicks += 1
+        if seen == 0:
+            link.unique_clicks += 1
+        s.add(LinkEvent(link_id=link.id, campaign_id=link.campaign_id,
+                        group_id=link.group_id, visitor_hash=vh,
+                        user_agent=request.headers.get("user-agent", "")[:300]))
+        s.commit()
+        target = link.target_url
+    return RedirectResponse(target or "/", status_code=302)
+
+
+@app.get("/m/{token}")
+async def tracked_media(token: str, request: Request):
+    """Tracked media landing endpoint. This is metric M5, and it is the only
+    reason a media view is measurable at all: a file sent as a direct
+    WhatsApp attachment reports nothing back."""
+    parsed = read_media_token(token)
+    if not parsed:
+        raise HTTPException(404, "Unknown media link")
+    cid, gid, mid = parsed
+    with SessionLocal() as s:
+        m = s.get(Media, mid)
+        if not m:
+            raise HTTPException(404, "Media not found")
+        s.add(MediaEvent(media_id=mid, campaign_id=cid, group_id=gid, kind="view"))
+        s.commit()
+        name, mime, path, size = m.filename, m.mime, m.stored_path, m.size_bytes
+    html = f"""<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{name}</title>
+<style>
+ :root{{color-scheme:light dark}}
+ body{{margin:0;font:15px/1.5 system-ui,Segoe UI,sans-serif;background:#f1f5fa;
+      color:#1f242b;display:grid;place-items:center;min-height:100vh;padding:16px}}
+ .card{{background:#fff;border:1px solid #cbd8e6;border-radius:12px;padding:28px;
+      max-width:520px;width:100%;box-shadow:0 2px 14px rgba(14,42,71,.08)}}
+ h1{{margin:0 0 4px;font-size:19px;color:#0e2a47}}
+ p{{margin:6px 0;color:#5c6672;font-size:13px}}
+ a.btn{{display:inline-block;margin-top:14px;background:#1e5c9e;color:#fff;
+      text-decoration:none;padding:10px 18px;border-radius:7px;font-weight:600}}
+ @media (prefers-color-scheme:dark){{
+   body{{background:#0e1620;color:#e8eef6}} .card{{background:#16202e;border-color:#27384d}}
+   h1{{color:#cfe0f5}} p{{color:#9fb0c4}} }}
+</style>
+<div class="card">
+ <h1>{name}</h1>
+ <p>{mime} &middot; {size/1024:.0f} KB</p>
+ <p>Delivered by Gsure Technologies on behalf of the sender.</p>
+ <a class="btn" href="/m/{token}/file">Open file</a>
+ <p style="margin-top:16px;font-size:11px">This view has been recorded against
+ the campaign. Media delivered as a direct WhatsApp attachment cannot be
+ measured, which is why it is served through this page.</p>
+</div>"""
+    return HTMLResponse(html)
+
+
+@app.get("/m/{token}/file")
+async def tracked_media_file(token: str):
+    parsed = read_media_token(token)
+    if not parsed:
+        raise HTTPException(404, "Unknown media link")
+    cid, gid, mid = parsed
+    with SessionLocal() as s:
+        m = s.get(Media, mid)
+        if not m:
+            raise HTTPException(404, "Media not found")
+        s.add(MediaEvent(media_id=mid, campaign_id=cid, group_id=gid,
+                         kind="download"))
+        s.commit()
+        path, name, mime = m.stored_path, m.filename, m.mime
+    if not Path(path).exists():
+        raise HTTPException(404, "File missing from store")
+    return FileResponse(path, media_type=mime, filename=name)
+
+
+# =========================================================== Meta webhook
+@app.get("/webhooks/whatsapp")
+async def verify_webhook(request: Request):
+    """Meta's subscription handshake."""
+    p = request.query_params
+    if p.get("hub.mode") == "subscribe" and \
+            p.get("hub.verify_token") == config.CLOUD_VERIFY_TOKEN:
+        return Response(p.get("hub.challenge", ""), media_type="text/plain")
+    raise HTTPException(403, "Verification failed")
+
+
+@app.post("/webhooks/whatsapp")
+async def whatsapp_webhook(request: Request):
+    """Consumes the documented status vocabulary: sent, delivered, read,
+    failed. This is how metrics M1, M2, M3 and M9 arrive when the Cloud API
+    adapter is in use, and how M6 arrives for inbound replies."""
+    payload = await body_json(request)
+    applied = {"statuses": 0, "messages": 0}
+    with SessionLocal() as s:
+        for entry in payload.get("entry", []):
+            for ch in entry.get("changes", []):
+                value = ch.get("value", {})
+                # Statuses go through the same forward only, idempotent path
+                # as the linked device receipts: a replayed or late event can
+                # never move a message backwards or double count it.
+                items = []
+                for st in value.get("statuses", []):
+                    code = {"sent": 2, "delivered": 3, "read": 4, "failed": 0}.get(st.get("status"))
+                    if code is None or not st.get("id"):
+                        continue
+                    errs = st.get("errors") or []
+                    items.append({"kind": "status", "id": st["id"], "status": code,
+                                  "ts_ms": int(st.get("timestamp") or 0) * 1000 or None,
+                                  "error": ({"code": errs[0].get("code"),
+                                             "title": errs[0].get("title", "")} if errs else None)})
+                if items:
+                    import receipts as receipts_mod
+                    receipts_mod.apply_receipts(items)
+                    applied["statuses"] += len(items)
+                for msg in value.get("messages", []):
+                    gid_raw = msg.get("group_id") or msg.get("from", "")
+                    g = s.scalar(select(Group).where(Group.wa_group_id == gid_raw))
+                    if not g:
+                        continue
+                    d = s.scalar(select(Delivery).where(
+                        Delivery.group_id == g.id).order_by(Delivery.id.desc()))
+                    text = (msg.get("text") or {}).get("body", "")
+                    kind = "optout" if text.strip().lower() in (
+                        "stop", "unsubscribe", "opt out") else "reply"
+                    s.add(Interaction(campaign_id=d.campaign_id if d else 0,
+                                      group_id=g.id, kind=kind, text=text[:500]))
+                    applied["messages"] += 1
+        s.commit()
+    return ok(received=True, **applied)
+
+
+# ================================================================ frontend
+@app.get("/health")
+async def health():
+    return ok(status="ok", time=utcnow().isoformat())
+
+
+app.mount("/", StaticFiles(directory=str(FRONTEND), html=True), name="frontend")

@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dissemination &amp; Analytics</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%23141416'/><path d='M16 6a10 10 0 1 0 10 10h-5a5 5 0 1 1-5-5V6Z' fill='white'/><circle cx='22.5' cy='9.5' r='3' fill='white'/></svg>">
+</head>
+<body>
+
+<!-- =============================================================== LOGIN -->
+<div class="login-wrap" id="login">
+  <div class="login-card">
+    <div class="brand">
+      <div class="brand-mark" id="loginLogo"></div>
+      <div class="brand-text">
+        <strong>Dissemination &amp; Analytics</strong>
+        <span>Gsure Technologies Private Limited</span>
+      </div>
+    </div>
+    <div id="loginErr" class="err hidden"></div>
+    <form id="loginForm">
+      <div class="field">
+        <label for="email">Email</label>
+        <input id="email" type="email" value="admin@gsuretech.com" autocomplete="username" required>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" required>
+      </div>
+      <button class="btn primary" style="width:100%;margin-top:6px;height:40px" type="submit">Sign in</button>
+    </form>
+  </div>
+</div>
+
+<!-- ================================================================= APP -->
+<div class="app" id="app">
+  <nav class="rail" aria-label="Sections">
+    <div class="rail-logo" id="railLogo"></div>
+    <div class="rail-items" id="railItems"></div>
+    <div class="rail-foot">
+      <button class="rail-btn" id="railSettings" title="Channels and settings"></button>
+      <button class="rail-me" id="railMe" title="Account"></button>
+    </div>
+  </nav>
+
+  <aside class="subnav" id="subnav" aria-label="Navigation"></aside>
+  <div class="sn-backdrop" id="snBackdrop"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn ghost" id="snToggle" aria-label="Toggle sidebar"></button>
+      <button class="crumb-back" id="backBtn"></button>
+      <span class="crumb-div"></span>
+      <div class="crumbs" id="crumbs"></div>
+      <div class="spacer"></div>
+      <div class="cmd" id="cmd">
+        <div class="cmd-box">
+          <span id="cmdIcon"></span>
+          <input id="cmdInput" placeholder="Search groups, campaigns or pages" autocomplete="off" aria-label="Search">
+          <span class="kbd">Ctrl K</span>
+        </div>
+        <div class="menu" id="cmdMenu" role="listbox"></div>
+      </div>
+      <button class="pill warn hidden" id="livePaused" title="Resume live updates" style="cursor:pointer;height:30px">
+        &#10074;&#10074; Live updates paused</button>
+      <div style="position:relative">
+        <button class="icon-btn" id="bellBtn" title="Activity"></button>
+        <div class="menu" id="bellMenu" style="right:0;top:46px;width:360px"></div>
+      </div>
+    </header>
+
+    <div class="page-head" id="pageHead">
+      <div style="min-width:0">
+        <h1 id="viewTitle">Dashboard</h1>
+        <p id="viewSub"></p>
+      </div>
+      <div class="page-actions" id="pageActions"></div>
+    </div>
+    <div class="page-tabs" id="pageTabs"></div>
+    <div class="content" id="content"></div>
+  </div>
+</div>
+
+<div class="menu" id="meMenu" style="position:fixed;left:72px;bottom:16px;width:250px"></div>
+<div class="modal-bg" id="modalBg"><div class="modal" id="modal"></div></div>
+<div class="tip" id="tip"></div>
+
+<script src="/ui.js"></script>
+<script src="/app.js"></script>
+<script src="/chats.js"></script>
+<script src="/messages.js"></script>
+</body>
+</html>

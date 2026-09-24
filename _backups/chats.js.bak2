@@ -1,0 +1,277 @@
+/* Group chats: read and reply to real WhatsApp groups from the platform.
+   Gsure Technologies Private Limited. Loaded after app.js and uses its helpers. */
+'use strict';
+
+const zdate = (iso) => new Date(iso + (iso && !iso.endsWith('Z') ? 'Z' : ''));
+const hm = (d) => d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
+function shortWhen(iso) {
+  if (!iso) return '';
+  const d = zdate(iso), now = new Date();
+  if (d.toDateString() === now.toDateString()) return hm(d);
+  const y = new Date(now); y.setDate(now.getDate() - 1);
+  if (d.toDateString() === y.toDateString()) return 'Yesterday';
+  return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
+}
+function dayLabel(d) {
+  const now = new Date(), y = new Date(now); y.setDate(now.getDate() - 1);
+  if (d.toDateString() === now.toDateString()) return 'Today';
+  if (d.toDateString() === y.toDateString()) return 'Yesterday';
+  return d.toLocaleDateString('en-IN', { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric' });
+}
+
+S.chat = S.chat || { gid: null, items: [], sig: '', q: '', list: [], canSendRole: false };
+
+VIEWS.chats = {
+  title: 'Chats', sub: 'Read and reply to your WhatsApp groups from here',
+  async render(c) {
+    c.innerHTML = `
+      <div class="chat-shell">
+        <div class="chat-list">
+          <div class="search"><input type="search" id="chQ" placeholder="Search groups" value="${esc(S.chat.q)}"></div>
+          <div class="chat-items" id="chItems"><div class="empty"><span class="spin"></span></div></div>
+        </div>
+        <div class="convo" id="convo"><div class="convo-empty">Choose a group on the left.</div></div>
+      </div>`;
+    $('#chQ', c).oninput = (e) => { S.chat.q = e.target.value; paintList(); };
+    await loadList();
+    if (!S.chat.gid && S.chat.list.length) S.chat.gid = S.chat.list[0].group_id;
+    if (S.chat.gid) openChat(S.chat.gid, true);
+    every(4000, () => { if (S.view === 'chats' && S.chat.gid) refreshConvo(false); });
+    every(12000, () => { if (S.view === 'chats') loadList(); });
+  }
+};
+
+async function loadList() {
+  try {
+    const d = await api.get('/api/chats');
+    S.chat.list = d.chats;
+    S.chat.canSendRole = d.can_send;
+    paintList();
+  } catch (e) {
+    const el = $('#chItems');
+    if (el) el.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+
+function paintList() {
+  const el = $('#chItems');
+  if (!el) return;
+  const q = S.chat.q.trim().toLowerCase();
+  const rows = S.chat.list.filter(x => !q || x.name.toLowerCase().includes(q));
+  if (!S.chat.list.length) {
+    el.innerHTML = `<div class="empty">No live groups yet.<br>Link WhatsApp and import groups
+      from <a href="#" id="toCh">Channels</a>.</div>`;
+    const a = $('#toCh'); if (a) a.onclick = (e) => { e.preventDefault(); go('channels'); };
+    return;
+  }
+  el.innerHTML = rows.map(x => `
+    <button class="chat-item ${x.group_id === S.chat.gid ? 'active' : ''}" data-g="${x.group_id}">
+      <div class="row1"><span class="nm">${esc(x.name)}</span>
+        <span class="tm">${esc(shortWhen(x.last_ts))}</span></div>
+      <div class="row1"><span class="pv" style="flex:1">${x.admins_only && !x.can_send ? '\u{1F512} ' : ''}${esc(x.preview || 'No messages captured yet')}</span>
+        ${x.messages_24h ? `<span class="badge" title="Messages in the last 24 hours">${x.messages_24h}</span>` : ''}</div>
+    </button>`).join('') || '<div class="empty">No group matches.</div>';
+  $$('[data-g]', el).forEach(b => b.onclick = () => openChat(+b.dataset.g, true));
+}
+
+function chatMeta(gid) { return S.chat.list.find(x => x.group_id === gid) || {}; }
+
+function openChat(gid, fresh) {
+  S.chat.gid = gid;
+  S.chat.items = []; S.chat.sig = ''; S.chat.more = null;
+  S.replyTo = null; S.attach = null;
+  paintList();
+  const m = chatMeta(gid);
+  const role = S.chat.canSendRole;
+  const blocked = !role ? `Your role can read these messages but not send. Ask an administrator for Campaign Manager access.`
+                : (m.can_send === false ? 'Only admins can send messages in this group.' : '');
+  $('#convo').innerHTML = `
+    <div class="convo-head">
+      <div style="min-width:0;flex:1">
+        <h2 style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.name || 'Group')}</h2>
+        <div class="sub">${n(m.members)} members${m.admins_only ? ' · admins only can send' : ''}</div>
+      </div>
+      <button class="btn sm" id="chInfo">${icon('chart', 14)} Group insights</button>
+    </div>
+    <div class="convo-body" id="cvBody"><div class="empty"><span class="spin"></span></div></div>
+    ${blocked ? `<div class="composer"><div class="note warn" style="margin:0">${esc(blocked)}</div></div>` : `
+    <div class="composer">
+      <div class="ctx hidden" id="cvReply"></div>
+      <div class="ctx hidden" id="cvFile"></div>
+      <div class="row">
+        <label class="btn" title="Attach a file" style="height:40px;width:40px;padding:0">${icon('paperclip', 17)}
+          <input type="file" id="cvAttach" style="display:none"></label>
+        <textarea id="cvText" rows="1" placeholder="Type a message"></textarea>
+        <button class="btn primary" id="cvSend" style="height:40px">${icon('send', 15)} Send</button>
+      </div>
+      <div class="foot"><span>Enter to send, Shift+Enter for a new line</span>
+        <span>Sends from your linked WhatsApp number</span></div>
+    </div>`}`;
+
+  $('#chInfo').onclick = () => openGroup(gid);
+  const ta = $('#cvText');
+  if (ta) {
+    ta.addEventListener('input', () => { ta.style.height = 'auto'; ta.style.height = Math.min(160, ta.scrollHeight) + 'px'; });
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendChat(); }
+    });
+    $('#cvSend').onclick = sendChat;
+    $('#cvAttach').onchange = (e) => {
+      const f = e.target.files[0];
+      S.attach = f || null;
+      paintContext();
+    };
+    ta.focus();
+  }
+  refreshConvo(true);
+}
+
+function paintContext() {
+  const r = $('#cvReply'), f = $('#cvFile');
+  if (!r || !f) return;
+  if (S.replyTo) {
+    r.innerHTML = `<span>Replying to <strong>${esc(S.replyTo.who)}</strong>: ${esc(S.replyTo.text.slice(0, 80))}</span>
+      <button title="Cancel reply">✕</button>`;
+    r.classList.remove('hidden');
+    $('button', r).onclick = () => { S.replyTo = null; paintContext(); };
+  } else r.classList.add('hidden');
+  if (S.attach) {
+    f.innerHTML = `<span>\u{1F4CE} ${esc(S.attach.name)} (${Math.max(1, Math.round(S.attach.size / 1024))} KB). Your text becomes the caption.</span>
+      <button title="Remove">✕</button>`;
+    f.classList.remove('hidden');
+    $('button', f).onclick = () => { S.attach = null; $('#cvAttach').value = ''; paintContext(); };
+  } else f.classList.add('hidden');
+}
+
+async function refreshConvo(first) {
+  const gid = S.chat.gid;
+  let d;
+  try { d = await api.get(`/api/groups/${gid}/messages?limit=60`); }
+  catch (e) { return; }
+  if (gid !== S.chat.gid) return;                   // switched chats meanwhile
+  const latest = d.items.slice().reverse();
+  const byId = new Map(S.chat.items.map(m => [m.msg_id, m]));
+  latest.forEach(m => byId.set(m.msg_id, m));       // newer data wins
+  const merged = [...byId.values()].sort((a, b) => a.ts.localeCompare(b.ts));
+  const sig = merged.map(m => `${m.msg_id}:${m.read}:${m.delivered}:${m.reactions.length}`).join('|');
+  if (first && S.chat.more === null) S.chat.more = d.next_before;
+  if (sig === S.chat.sig && !first) return;
+  S.chat.items = merged;
+  S.chat.sig = sig;
+  paintConvo(first);
+}
+
+function ticks(m) {
+  if (!m.from_me) return '';
+  if (m.read) return `<span class="tick-read" title="Read by ${m.read}" data-rc="${esc(m.msg_id)}" style="cursor:pointer">✓✓</span>`;
+  if (m.delivered) return `<span title="Delivered to ${m.delivered}" data-rc="${esc(m.msg_id)}" style="cursor:pointer">✓✓</span>`;
+  return '<span title="Sent">✓</span>';
+}
+
+function paintConvo(forceBottom) {
+  const body = $('#cvBody');
+  if (!body) return;
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 90;
+  let html = '', lastDay = '';
+  const top = S.chat.more
+    ? `<div style="text-align:center;margin-bottom:8px"><button class="btn sm" id="cvOlder">Load earlier messages</button></div>`
+    : (S.chat.items.length ? `<div style="text-align:center;margin-bottom:8px">
+        <button class="btn sm" id="cvPhone" title="Ask your phone for up to 50 older messages">Fetch older from phone</button></div>` : '');
+  for (const m of S.chat.items) {
+    const d = zdate(m.ts), day = d.toDateString();
+    if (day !== lastDay) { html += `<div class="day-sep"><span>${esc(dayLabel(d))}</span></div>`; lastDay = day; }
+    const rx = m.reactions && m.reactions.length;
+    html += `
+      <div class="msg ${m.from_me ? 'me' : ''} ${rx ? 'has-rx' : ''}">
+        <div class="bubble">
+          ${!m.from_me ? `<div class="who">${esc(m.sender)}</div>` : ''}
+          ${m.quoted ? `<div class="q"><strong>${esc(m.quoted[0])}</strong><br>${esc(m.quoted[1])}</div>` : ''}
+          ${m.type !== 'text' ? `<div><span class="chip">${esc(m.type)}</span></div>` : ''}
+          <div class="txt">${esc(m.text) || (m.type === 'text' ? '' : '')}</div>
+          <div class="meta">
+            <button class="act" data-reply="${esc(m.msg_id)}">Reply</button>
+            <span>${esc(hm(d))}</span>${ticks(m)}
+          </div>
+          ${rx ? `<div class="rx">${m.reactions.map(esc).join('')}</div>` : ''}
+        </div>
+      </div>`;
+  }
+  body.innerHTML = top + (html || `<div class="convo-empty" style="min-height:260px">No messages captured in this group yet.<br>
+      New messages appear here as they arrive, and you can send the first one below.</div>`);
+  $$('[data-reply]', body).forEach(b => b.onclick = () => {
+    const m = S.chat.items.find(x => x.msg_id === b.dataset.reply);
+    if (!m) return;
+    S.replyTo = { id: m.msg_id, who: m.from_me ? 'You' : m.sender, text: m.text || `[${m.type}]` };
+    paintContext();
+    const ta = $('#cvText'); if (ta) ta.focus();
+  });
+  $$('[data-rc]', body).forEach(t => t.onclick = () => receiptModal(t.dataset.rc));
+  const older = $('#cvOlder');
+  if (older) older.onclick = loadOlder;
+  const ph = $('#cvPhone');
+  if (ph) ph.onclick = async () => {
+    ph.disabled = true;
+    try {
+      await api.post(`/api/groups/${S.chat.gid}/history`);
+      toast('Asked your phone for older messages. They appear here within a few seconds.');
+      setTimeout(() => refreshAllLoaded(), 6000);
+    } catch (e) { toast(e.message, true); ph.disabled = false; }
+  };
+  if (forceBottom || nearBottom) body.scrollTop = body.scrollHeight;
+}
+
+async function loadOlder() {
+  const body = $('#cvBody');
+  const before = S.chat.more;
+  if (!before) return;
+  const d = await api.get(`/api/groups/${S.chat.gid}/messages?limit=60&before=${encodeURIComponent(before)}`);
+  const h0 = body.scrollHeight;
+  const byId = new Map(S.chat.items.map(m => [m.msg_id, m]));
+  d.items.forEach(m => byId.set(m.msg_id, m));
+  S.chat.items = [...byId.values()].sort((a, b) => a.ts.localeCompare(b.ts));
+  S.chat.more = d.next_before;
+  S.chat.sig = '';
+  paintConvo(false);
+  body.scrollTop = body.scrollHeight - h0;          // keep the reader's place
+}
+
+async function refreshAllLoaded() {
+  // history arrives asynchronously; pull a wider window once it has landed
+  const d = await api.get(`/api/groups/${S.chat.gid}/messages?limit=200`);
+  const byId = new Map(S.chat.items.map(m => [m.msg_id, m]));
+  d.items.forEach(m => byId.set(m.msg_id, m));
+  S.chat.items = [...byId.values()].sort((a, b) => a.ts.localeCompare(b.ts));
+  S.chat.more = d.next_before;
+  S.chat.sig = '';
+  paintConvo(false);
+}
+
+async function sendChat() {
+  const ta = $('#cvText'), btn = $('#cvSend');
+  if (!ta || btn.disabled) return;
+  const text = ta.value.trim();
+  if (!text && !S.attach) return;
+  const fd = new FormData();
+  fd.append('text', text);
+  if (S.replyTo) fd.append('reply_to', S.replyTo.id);
+  if (S.attach) fd.append('file', S.attach);
+  btn.disabled = true; btn.textContent = 'Sending…';
+  try {
+    await api.form(`/api/groups/${S.chat.gid}/send`, fd);
+    ta.value = ''; ta.style.height = 'auto';
+    S.replyTo = null; S.attach = null;
+    const fi = $('#cvAttach'); if (fi) fi.value = '';
+    paintContext();
+    await refreshConvo(false);
+    const body = $('#cvBody'); if (body) body.scrollTop = body.scrollHeight;
+    loadList();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false; btn.innerHTML = icon('send', 15) + ' Send';
+    ta.focus();
+  }
+}
+
+// Chats needs the full height, so it hides the page header.
+VIEWS.chats.bare = true;

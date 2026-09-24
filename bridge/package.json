@@ -1,0 +1,19 @@
+{
+  "name": "wdap-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Linked device bridge for the WhatsApp Dissemination & Analytics Platform proof of concept. Gsure Technologies Private Limited.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc.14",
+    "qrcode": "^1.5.4",
+    "pino": "^9.5.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,1760 @@
+/* WhatsApp Dissemination & Analytics Platform: proof of concept UI
+   Gsure Technologies Private Limited */
+'use strict';
+
+// ------------------------------------------------------------------ api
+const api = {
+  async req(method, url, body, isForm) {
+    const opt = { method, headers: {}, credentials: 'same-origin' };
+    if (body !== undefined) {
+      if (isForm) { opt.body = body; }
+      else { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+    }
+    const r = await fetch(url, opt);
+    if (r.status === 401) { showLogin(); throw new Error('Session expired'); }
+    const ct = r.headers.get('content-type') || '';
+    const data = ct.includes('json') ? await r.json() : await r.text();
+    if (!r.ok) throw new Error((data && data.detail) || r.statusText);
+    return data;
+  },
+  get(u) { return this.req('GET', u); },
+  post(u, b) { return this.req('POST', u, b === undefined ? {} : b); },
+  patch(u, b) { return this.req('PATCH', u, b); },
+  del(u) { return this.req('DELETE', u); },
+  form(u, fd) { return this.req('POST', u, fd, true); },
+};
+
+const S = { user: null, sys: null, view: 'dashboard', campaign: null, timers: [] };
+const $ = (s, r) => (r || document).querySelector(s);
+const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
+  c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const n = (v) => (v == null ? '0' : Number(v).toLocaleString('en-IN'));
+const pct = (v) => (v == null ? '0' : Number(v).toFixed(1)) + '%';
+const clearTimers = () => { S.timers.forEach(clearInterval); S.timers = []; };
+// Auto refresh obeys the "Live updates" switch in the sidebar.
+const every = (ms, fn) => { S.timers.push(setInterval(() => { if (S.live !== false) fn(); }, ms)); };
+const when = (iso) => iso ? new Date(iso).toLocaleString('en-IN',
+  { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—';
+const can = (p) => S.user && S.user.permissions.includes(p);
+
+// ----------------------------------------------------------------- chart
+// Colours come from CSS custom properties so light and dark stay in one place.
+const css = (name) => getComputedStyle(document.documentElement)
+  .getPropertyValue(name).trim();
+const SERIES = () => [css('--series-1'), css('--series-2'), css('--series-3')];
+
+const tipEl = () => $('#tip');
+function showTip(html, x, y) {
+  const t = tipEl();
+  t.innerHTML = html;
+  t.classList.add('on');
+  const r = t.getBoundingClientRect();
+  let left = x + 14, top = y - r.height - 10;
+  if (left + r.width > innerWidth - 8) left = x - r.width - 14;
+  if (top < 8) top = y + 16;
+  t.style.left = left + 'px'; t.style.top = top + 'px';
+}
+const hideTip = () => tipEl().classList.remove('on');
+
+function niceMax(v) {
+  if (v <= 5) return 5;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  return Math.ceil(v / p * 2) / 2 * p;
+}
+
+/* Multi-series line chart with crosshair and tooltip.
+   Direct labels on the final point of each series (selective), legend always
+   present for >= 2 series, and a table view, which is the relief the palette
+   validator requires for the aqua slot on a light surface. */
+function lineChart(el, opts) {
+  const { labels, series, yLabel } = opts;
+  const W = Math.max(520, el.clientWidth || 700), H = opts.height || 236;
+  const m = { t: 14, r: 76, b: 26, l: 46 };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const cols = SERIES();
+  const max = niceMax(Math.max(1, ...series.flatMap(s => s.values)));
+  const X = i => m.l + (labels.length < 2 ? iw / 2 : (iw * i) / (labels.length - 1));
+  const Y = v => m.t + ih - (v / max) * ih;
+
+  const ticks = [0, .25, .5, .75, 1].map(f => Math.round(max * f));
+  let g = '';
+  ticks.forEach(tv => {
+    g += `<line class="grid-line" x1="${m.l}" y1="${Y(tv)}" x2="${m.l + iw}" y2="${Y(tv)}"/>` +
+         `<text x="${m.l - 8}" y="${Y(tv) + 3.5}" text-anchor="end">${n(tv)}</text>`;
+  });
+  g += `<line class="axis-line" x1="${m.l}" y1="${m.t + ih}" x2="${m.l + iw}" y2="${m.t + ih}"/>`;
+
+  const step = Math.max(1, Math.ceil(labels.length / 7));
+  labels.forEach((lb, i) => {
+    if (!showTick(i, labels.length, step)) return;
+    g += `<text x="${X(i)}" y="${H - 7}" text-anchor="middle">${esc(lb)}</text>`;
+  });
+
+  // direct labels, selective: only the series ends, spread so they never overlap
+  const endYs = spreadLabels(series.map(s => Y(s.values[s.values.length - 1]) + 3.5), 13, m.t + 4, m.t + ih + 4);
+  series.forEach((s, si) => {
+    const c = cols[si % cols.length];
+    const d = s.values.map((v, i) => `${i ? 'L' : 'M'}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
+    g += `<path class="series-line" d="${d}" stroke="${c}"/>`;
+    const li = s.values.length - 1;
+    g += `<circle class="dot" cx="${X(li)}" cy="${Y(s.values[li])}" r="4.5" fill="${c}"/>`;
+    g += `<text class="lbl" x="${m.l + iw + 9}" y="${endYs[si]}">${esc(s.name)}</text>`;
+  });
+
+  g += `<line id="cross" class="axis-line" y1="${m.t}" y2="${m.t + ih}" style="opacity:0"/>`;
+  el.innerHTML =
+    `<ul class="legend">${series.map((s, i) =>
+      `<li><span class="swatch" style="background:${cols[i % cols.length]}"></span>${esc(s.name)}</li>`).join('')}</ul>
+     <svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet"
+          role="img" aria-label="${esc(yLabel || 'Chart')}">${g}
+       <rect x="${m.l}" y="${m.t}" width="${iw}" height="${ih}" fill="transparent" id="hit"/>
+     </svg>
+     <div class="chart-foot">
+       <span style="font-size:11px;color:var(--text-muted)">${esc(yLabel || '')}</span>
+       <button class="btn sm" data-tbl>Table view</button>
+     </div>
+     <div class="tbl-wrap hidden" data-tblwrap style="margin-top:10px">
+       <table><thead><tr><th>Point</th>${series.map(s => `<th class="num">${esc(s.name)}</th>`).join('')}</tr></thead>
+       <tbody>${labels.map((lb, i) =>
+         `<tr><td>${esc(lb)}</td>${series.map(s => `<td class="num">${n(s.values[i])}</td>`).join('')}</tr>`).join('')}
+       </tbody></table>
+     </div>`;
+
+  const svg = $('svg', el), cross = $('#cross', svg);
+  $('[data-tbl]', el).onclick = (e) => {
+    const w = $('[data-tblwrap]', el);
+    w.classList.toggle('hidden');
+    e.target.textContent = w.classList.contains('hidden') ? 'Table view' : 'Hide table';
+  };
+  $('#hit', svg).addEventListener('mousemove', (ev) => {
+    const b = svg.getBoundingClientRect();
+    const sx = (ev.clientX - b.left) * (W / b.width);
+    let i = Math.round(((sx - m.l) / iw) * (labels.length - 1));
+    i = Math.max(0, Math.min(labels.length - 1, i));
+    cross.setAttribute('x1', X(i)); cross.setAttribute('x2', X(i));
+    cross.style.opacity = .55;
+    showTip(`<div class="t-title">${esc(labels[i])}</div>` + series.map((s, si) =>
+      `<div class="t-row"><span class="k"><span class="swatch" style="width:9px;height:9px;border-radius:3px;background:${cols[si % cols.length]}"></span>${esc(s.name)}</span><span class="v">${n(s.values[i])}</span></div>`).join(''),
+      ev.clientX, ev.clientY);
+  });
+  $('#hit', svg).addEventListener('mouseleave', () => { hideTip(); cross.style.opacity = 0; });
+}
+
+/* Grouped bars: 4px rounded data-ends anchored to the baseline, 2px gap
+   between adjacent bars, direct value labels, legend, hover tooltip. */
+function barChart(el, opts) {
+  const { groups, series, yLabel } = opts;
+  const W = Math.max(480, el.clientWidth || 640), H = opts.height || 224;
+  const m = { t: 16, r: 14, b: 30, l: 46 };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const cols = SERIES();
+  const max = niceMax(Math.max(1, ...series.flatMap(s => s.values)));
+  const Y = v => m.t + ih - (v / max) * ih;
+  const gw = iw / groups.length, bw = Math.min(38, (gw - 14) / series.length - 2);
+  const dense = groups.length > 8;
+  const peak = Math.max(...series.flatMap(s => s.values));
+  const xStep = Math.max(1, Math.ceil(groups.length / 8));
+
+  let g = '';
+  [0, .5, 1].map(f => Math.round(max * f)).forEach(tv => {
+    g += `<line class="grid-line" x1="${m.l}" y1="${Y(tv)}" x2="${m.l + iw}" y2="${Y(tv)}"/>` +
+         `<text x="${m.l - 8}" y="${Y(tv) + 3.5}" text-anchor="end">${n(tv)}</text>`;
+  });
+  g += `<line class="axis-line" x1="${m.l}" y1="${m.t + ih}" x2="${m.l + iw}" y2="${m.t + ih}"/>`;
+
+  groups.forEach((gl, gi) => {
+    const cx = m.l + gw * gi + gw / 2;
+    const total = series.length * bw + (series.length - 1) * 2;
+    series.forEach((s, si) => {
+      const v = s.values[gi] || 0;
+      const x = cx - total / 2 + si * (bw + 2);
+      const h = Math.max(1, m.t + ih - Y(v));
+      g += `<rect x="${x}" y="${Y(v)}" width="${bw}" height="${h}" rx="4" ry="4"
+              fill="${cols[si % cols.length]}" data-g="${gi}" data-s="${si}" class="bar"/>`;
+      if (v > 0 && (!dense || v === peak))
+        g += `<text class="lbl" x="${x + bw / 2}" y="${Y(v) - 5}" text-anchor="middle">${n(v)}</text>`;
+    });
+    if (gi % xStep === 0 || gi === groups.length - 1)
+      g += `<text x="${cx}" y="${H - 9}" text-anchor="middle">${esc(gl)}</text>`;
+  });
+
+  // A single series needs no legend box: the card title names it.
+  el.innerHTML =
+    (series.length > 1 ? `<ul class="legend">${series.map((s, i) =>
+      `<li><span class="swatch" style="background:${cols[i % cols.length]}"></span>${esc(s.name)}</li>`).join('')}</ul>` : '') +
+    `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet"
+          role="img" aria-label="${esc(yLabel || 'Chart')}">${g}</svg>
+     <div class="chart-foot"><span style="font-size:11px;color:var(--text-muted)">${esc(yLabel || '')}</span></div>`;
+
+  $$('.bar', el).forEach(b => {
+    b.addEventListener('mousemove', ev => {
+      const gi = +b.dataset.g, si = +b.dataset.s;
+      showTip(`<div class="t-title">${esc(groups[gi])}</div>
+        <div class="t-row"><span class="k"><span class="swatch" style="width:9px;height:9px;border-radius:3px;background:${cols[si % cols.length]}"></span>${esc(series[si].name)}</span><span class="v">${n(series[si].values[gi])}</span></div>`,
+        ev.clientX, ev.clientY);
+    });
+    b.addEventListener('mouseleave', hideTip);
+  });
+}
+
+/* Delivery outcome is STATUS data, not a series, so it uses the reserved
+   status palette and every segment carries an icon and a label. */
+function statusBar(el, parts) {
+  // Delivery outcome is status data: reserved status palette, each segment
+  // labelled with an icon, rendered in the segmented style.
+  segBar(el, parts);
+}
+
+// ----------------------------------------------------------------- modal
+function modal(title, bodyHtml, footHtml) {
+  $('#modal').innerHTML =
+    `<header><h2>${esc(title)}</h2><div class="spacer"></div>
+       <button class="btn sm" data-x>Close</button></header>
+     <div class="body">${bodyHtml}</div>
+     ${footHtml ? `<footer>${footHtml}</footer>` : ''}`;
+  $('#modalBg').classList.add('on');
+  $('[data-x]', $('#modal')).onclick = closeModal;
+  return $('#modal');
+}
+const closeModal = () => $('#modalBg').classList.remove('on');
+$('#modalBg').addEventListener('click', e => { if (e.target.id === 'modalBg') closeModal(); });
+
+function toast(msg, bad) {
+  const d = document.createElement('div');
+  d.style.cssText = `position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:200;
+    background:var(--surface-1);border:1px solid ${bad ? 'var(--critical)' : 'var(--rule)'};
+    color:${bad ? 'var(--critical)' : 'var(--text-primary)'};padding:10px 16px;border-radius:9px;
+    box-shadow:var(--shadow);font-size:13px;font-weight:600`;
+  d.textContent = msg;
+  document.body.appendChild(d);
+  setTimeout(() => d.remove(), 3200);
+}
+
+// ----------------------------------------------------------------- views
+const VIEWS = {};
+
+VIEWS.dashboard = {
+  title: 'Overview', sub: 'Your WhatsApp group network, campaigns and delivery at a glance',
+  days: 14,
+  async render(c) {
+    const self = this;
+    const d = await api.get('/api/dashboard?days=' + this.days);
+    const s = d.summary, L = d.live;
+    let stack = '';
+    try { stack = avatarStack((await api.get('/api/users/brief')).users); } catch (e) { }
+    setActions(stack + (can('user.write') ? `<button class="btn primary" id="hdrInvite">${icon('userPlus')} Invite</button>` : ''));
+    const hi = $('#hdrInvite'); if (hi) hi.onclick = inviteModal;
+    setTabs([
+      { key: 'overview', label: 'Overview', icon: 'trend' },
+      { key: 'campaigns', label: 'Campaigns', icon: 'megaphone' },
+      { key: 'governor', label: 'Governor', icon: 'gauge' }],
+      can('report.export') ? `<a class="btn" href="/api/reports/groups.xlsx">${icon('download')} Export</a>` : '');
+
+    const days = d.by_date;
+    const lbl = x => new Date(x.date + 'T00:00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
+    const recent = d.recent;
+
+    c.innerHTML = `
+    <div data-tab="overview" class="grid g2">
+      <div class="col">
+        <div class="card">
+          <h2 data-icon="users">Network details</h2>
+          <div class="profile">
+            <span class="avatar" style="width:64px;height:64px;background:var(--rail)">${LOGO}</span>
+            <div style="min-width:0">
+              <div class="nm">${esc(L.account || 'WhatsApp not linked')}
+                ${L.linked ? '<span class="pill good">\u25CF Linked</span>' : '<span class="pill warn">\u25CB Not linked</span>'}</div>
+              <div class="chips">
+                <span class="chip">${icon('users', 13)} ${n(L.groups)} live groups</span>
+                <span class="chip">${icon('user', 13)} ${n(L.members)} members</span></div>
+            </div>
+          </div>
+          <div class="itabs">
+            <button class="itab active" data-it="net">Network</button>
+            <button class="itab" data-it="plat">Platform</button></div>
+          <div class="fields" data-itp="net">
+            ${fld('users', 'Groups under management', n(s.groups_total))}
+            ${fld('message', 'Live WhatsApp groups', n(L.groups))}
+            ${fld('megaphone', 'Campaigns', n(s.campaigns_total) + (s.campaigns_running ? ' (' + s.campaigns_running + ' running)' : ''))}
+            ${fld('send', 'Messages despatched', n(s.messages_total))}
+            ${fld('target', 'Groups reached', n(s.groups_reached) + ' (' + pct(s.reach_pct) + ')')}
+            ${fld('activity', 'Interactions recorded', n(s.interactions))}
+            <div class="fld full"><div class="lbl">${icon('hash', 14)} Channels</div>
+              <div style="margin-top:8px">${dotPill('Linked device', L.linked ? css('--good') : css('--critical'))}${dotPill('Simulator', css('--text-muted'))}${dotPill('Cloud API', css('--series-1'))}</div></div>
+          </div>
+          <div class="fields hidden" data-itp="plat">
+            ${fld('share', 'Default channel', esc(S.sys.default_channel))}
+            ${fld('clock', 'Interval scale', '\u00d7' + S.sys.time_scale)}
+            ${fld('gauge', 'Send rate', d.rate.rate_per_sec + ' per second')}
+            ${fld('calendar', 'Sent today', n(d.daily.sent_today) + ' of ' + n(d.daily.ceiling))}
+            ${fld('shield', 'Your role', esc(S.user.role.replace(/_/g, ' ')))}
+            ${fld('mail', 'Signed in as', esc(S.user.email))}
+          </div>
+        </div>
+        <div class="card">
+          <h2 data-icon="activity">Delivery overview</h2>
+          <div class="cap">Groups targeted and groups confirmed reached, per day</div>
+          <div id="dLine"></div>
+        </div>
+      </div>
+      <div class="col">
+        <div class="card">
+          <h2 data-icon="trend">Reach performance</h2>
+          <div class="kpi">${pct(s.reach_pct)}</div>
+          <div class="kpi-sub"><span class="delta-up">${n(s.groups_reached)}</span> of ${n(s.messages_total)} group sends confirmed delivered</div>
+          <div id="dStep" style="margin-top:14px"></div>
+        </div>
+        <div class="card">
+          <h2 data-icon="clock">Delivery outcome</h2>
+          <p class="big-line">Messages despatched</p>
+          <p class="big-sub"><strong>${n(s.messages_total)}</strong> group sends across all campaigns</p>
+          <div id="dSeg"></div>
+        </div>
+        <div class="card">
+          <h2 data-icon="folder">Campaign completion</h2>
+          <p class="big-sub" style="margin:0 0 4px">Recent campaigns</p>
+          <p class="big-line" style="margin-bottom:16px">${n(s.campaigns_total)} campaigns</p>
+          ${recent.length ? progressRows(recent.slice(0, 4).map(r => ({
+            label: r.code + '  ' + r.name, pct: r.targets ? 100 * r.reached / r.targets : 0 })))
+            : '<div class="empty">No campaigns yet.</div>'}
+        </div>
+      </div>
+    </div>
+
+    <div data-tab="campaigns" class="card">
+      <h2>Recent campaigns</h2>
+      <div class="cap">Most recent first</div>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Code</th><th>Campaign</th><th>Channel</th><th>Status</th><th class="num">Targets</th>
+          <th class="num">Reached</th><th class="num">Read</th><th class="num">Failed</th><th>Created</th></tr></thead>
+        <tbody>${recent.length ? recent.map(r => `<tr data-open="${r.id}" style="cursor:pointer">
+          <td class="mono">${esc(r.code)}</td><td>${esc(r.name)}</td><td>${esc(r.channel)}</td>
+          <td>${statusPill(r.status)}</td><td class="num">${n(r.targets)}</td><td class="num">${n(r.reached)}</td>
+          <td class="num">${n(r.read)}</td><td class="num">${n(r.failed)}</td>
+          <td class="nowrap">${when(r.created_at)}</td></tr>`).join('')
+          : '<tr><td colspan="9" class="empty">No campaigns yet.</td></tr>'}</tbody></table></div>
+    </div>
+
+    <div data-tab="governor" class="grid g2">
+      <div class="card">
+        <h2>Despatch governor</h2>
+        <div class="cap">Rate limiting is the main protection for the sending account</div>
+        <div class="fields">
+          ${fld('gauge', 'Nominal rate', d.rate.rate_per_sec + ' messages per second')}
+          ${fld('activity', 'Effective now', d.rate.effective_rate + ' per second (warm-up ramp)')}
+          ${fld('refresh', 'Randomised jitter', '\u00b1' + Math.round(d.rate.jitter * 100) + '%')}
+          ${fld('calendar', 'Sent today', n(d.daily.sent_today) + ' of ' + n(d.daily.ceiling) + ' ceiling')}
+        </div>
+        ${can('settings.write') ? `<div class="btn-row" style="margin-top:18px"><button class="btn" id="rateBtn">${icon('sliders')} Adjust rate</button></div>` : ''}
+      </div>
+      <div class="card">
+        <h2>How reach is counted</h2>
+        <div class="cap">Definitions behind the numbers</div>
+        <div class="note"><strong>M1 reached</strong> counts a group once the platform has confirmation the
+          message arrived. <strong>M3 pending</strong> is derived from the gap between a sent and a delivered
+          status, the one metric with no dedicated field in Meta's documentation.</div>
+      </div>
+    </div>`;
+
+    enhanceCards(c);
+    const stepCard = $('#dStep', c).closest('.card');
+    $('.ch-r', stepCard).innerHTML = `<label class="range">${icon('calendar')}<select id="dRange" aria-label="Range">
+      ${[7, 14, 30, 90].map(v => `<option value="${v}" ${v === d.days ? 'selected' : ''}>Last ${v} days</option>`).join('')}
+      </select></label>`;
+    $('#dRange', c).onchange = e => { self.days = +e.target.value; go('dashboard'); };
+    stepArea($('#dStep', c), { labels: days.map(lbl), values: days.map(x => x.targets),
+      seriesName: 'Groups targeted', yLabel: 'Groups targeted per day', height: 190 });
+    lineChart($('#dLine', c), { labels: days.map(lbl),
+      series: [{ name: 'Targeted', values: days.map(x => x.targets) },
+               { name: 'Reached', values: days.map(x => x.reached) }],
+      yLabel: 'Groups per day', height: 210 });
+    segBar($('#dSeg', c), [
+      { label: 'Reached', value: s.groups_reached, color: css('--good'), icon: '\u2713' },
+      { label: 'Pending', value: s.pending, color: css('--warning'), icon: '\u25CB' },
+      { label: 'Failed', value: s.failures, color: css('--critical'), icon: '\u2715' }]);
+    innerTabs(c);
+    $$('[data-open]', c).forEach(b => b.onclick = () => openCampaign(+b.dataset.open));
+    const rb = $('#rateBtn', c);
+    if (rb) rb.onclick = () => rateModal(d.rate);
+  }
+};
+
+const tile = (label, value, foot) =>
+  `<div class="card tile"><div class="label">${esc(label)}</div>
+   <div class="value">${value}</div><div class="foot">${esc(foot || '')}</div></div>`;
+
+function statusPill(st) {
+  const map = {
+    completed: ['good', '✓ completed'], running: ['info', '▸ running'],
+    partially_failed: ['warn', '⚠ partial'], failed: ['crit', '✕ failed'],
+    paused: ['warn', '‖ paused'], scheduled: ['info', '◷ scheduled'],
+    draft: ['', '○ draft'], cancelled: ['crit', '✕ cancelled'],
+  };
+  const [k, t] = map[st] || ['', st];
+  return `<span class="pill ${k}">${t}</span>`;
+}
+
+function rateModal(rate) {
+  modal('Adjust despatch rate', `
+    <div class="note warn" style="margin-bottom:14px">Rate governance is the primary
+      protection for the sending account. Raising it increases the account restriction
+      risk recorded as R1 in the proposal.</div>
+    <div class="field"><label>Messages per second</label>
+      <input id="rr" type="number" min="0.5" step="0.5" value="${rate.rate_per_sec}"></div>
+    <div class="field"><label>Randomised jitter (0 to 0.9)</label>
+      <input id="rj" type="number" min="0" max="0.9" step="0.05" value="${rate.jitter}"></div>`,
+    `<button class="btn" data-x2>Cancel</button><button class="btn primary" id="rsave">Save</button>`);
+  $('[data-x2]').onclick = closeModal;
+  $('#rsave').onclick = async () => {
+    await api.post('/api/settings/rate', { rate: +$('#rr').value, jitter: +$('#rj').value });
+    closeModal(); toast('Rate updated'); go('dashboard');
+  };
+}
+
+// ---------------------------------------------------------------- groups
+VIEWS.groups = {
+  title: 'Groups', sub: 'The group network under structured management',
+  state: { page: 1, q: '', category: '', folder: '', tag: '', source: null },
+  async render(c) {
+    const [f, srcs] = await Promise.all([api.get('/api/groups/facets'),
+                                         api.get('/api/groups/sources')]);
+    const st = this.state;
+    // Default to the real WhatsApp groups once any have been imported.
+    if (st.source === null)
+      st.source = srcs.sources.some(x => x.value === 'linked_device') ? 'linked_device' : '';
+    const srcLabel = { linked_device: 'Your WhatsApp groups', seed: 'Demo groups',
+                       csv: 'CSV import', manual: 'Added manually' };
+    c.innerHTML = `
+      <div class="toolbar">
+        <select id="gsrc"><option value="">All sources</option>
+          ${srcs.sources.map(x => `<option ${st.source === x.value ? 'selected' : ''} value="${esc(x.value)}">${esc(srcLabel[x.value] || x.value)} (${n(x.count)})</option>`).join('')}</select>
+        <input type="search" id="gq" placeholder="Search name, id or region" value="${esc(st.q)}">
+        <select id="gcat"><option value="">All categories</option>
+          ${f.categories.map(x => `<option ${st.category === x.value ? 'selected' : ''} value="${esc(x.value)}">${esc(x.value)} (${x.count})</option>`).join('')}</select>
+        <select id="gfold"><option value="">All folders</option>
+          ${f.folders.map(x => `<option ${st.folder === x.value ? 'selected' : ''} value="${esc(x.value)}">${esc(x.value)} (${x.count})</option>`).join('')}</select>
+        <select id="gtag"><option value="">All tags</option>
+          ${f.tags.map(x => `<option ${st.tag === x.value ? 'selected' : ''} value="${esc(x.value)}">${esc(x.value)} (${x.count})</option>`).join('')}</select>
+        <div class="spacer"></div>
+        ${can('group.write') ? '<button class="btn sm" id="impBtn">Import CSV</button>' : ''}
+        ${can('report.export') ? '<a class="btn sm" href="/api/reports/groups.xlsx">Export Excel</a>' : ''}
+      </div>
+      <div class="card"><div id="gtbl"><div class="empty"><span class="spin"></span></div></div></div>`;
+
+    const load = async () => {
+      const p = new URLSearchParams({ page: st.page, size: 50, q: st.q, category: st.category, folder: st.folder, tag: st.tag, source: st.source || '' });
+      const d = await api.get('/api/groups?' + p);
+      const pages = Math.max(1, Math.ceil(d.total / d.size));
+      $('#gtbl', c).innerHTML = `
+        <div style="display:flex;align-items:center;margin-bottom:10px">
+          <div style="font-size:12.5px;color:var(--text-secondary)">
+            <strong>${n(d.total)}</strong> groups match &middot; page ${d.page} of ${n(pages)}</div>
+          <div class="spacer"></div>
+          <div class="btn-row">
+            <button class="btn sm" ${d.page <= 1 ? 'disabled' : ''} id="gprev">Previous</button>
+            <button class="btn sm" ${d.page >= pages ? 'disabled' : ''} id="gnext">Next</button></div>
+        </div>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>Group</th><th>Category</th><th>Folder</th><th>Tags</th>
+            <th class="num">Members</th><th>Region</th><th>State</th><th class="mono">WhatsApp id</th></tr></thead>
+          <tbody>${d.items.map(g => `<tr data-gid="${g.id}" style="cursor:pointer" title="Open group">
+            <td><strong>${esc(g.name)}</strong>${g.source === 'linked_device' ? ' <span class="pill good" style="margin-left:4px">live</span>' : ''}</td><td>${esc(g.category)}</td><td>${esc(g.folder)}</td>
+            <td>${g.tags.map(t => `<span class="chip">${esc(t)}</span>`).join('')}</td>
+            <td class="num">${n(g.member_count)}</td><td>${esc(g.region)}</td>
+            <td>${g.active ? '<span class="pill good">✓ active</span>' : '<span class="pill">○ inactive</span>'}</td>
+            <td class="mono">${esc(g.wa_group_id)}</td></tr>`).join('')}</tbody></table></div>`;
+      $$('[data-gid]', c).forEach(r => r.onclick = () => openGroup(+r.dataset.gid));
+      $('#gprev', c).onclick = () => { st.page--; load(); };
+      $('#gnext', c).onclick = () => { st.page++; load(); };
+    };
+    let deb;
+    $('#gq', c).oninput = e => { clearTimeout(deb); deb = setTimeout(() => { st.q = e.target.value; st.page = 1; load(); }, 280); };
+    ['gsrc:source', 'gcat:category', 'gfold:folder', 'gtag:tag'].forEach(pair => {
+      const [id, key] = pair.split(':');
+      $('#' + id, c).onchange = e => { st[key] = e.target.value; st.page = 1; load(); };
+    });
+    const ib = $('#impBtn', c);
+    if (ib) ib.onclick = importModal;
+    load();
+  }
+};
+
+function importModal() {
+  modal('Import groups from CSV', `
+    <p style="font-size:12.5px;color:var(--text-secondary);margin-top:0">
+      Columns: <span class="mono">wa_group_id, name, category, folder, tags, member_count, region</span>.
+      Tags are separated by a pipe. Existing rows are matched on the WhatsApp group id and updated.</p>
+    <div class="field"><label>CSV file</label><input type="file" id="csvf" accept=".csv,text/csv"></div>
+    <div class="note">A real import from the client's own network is done from the
+      Channels view: only the linked device route can enumerate pre-existing groups.</div>`,
+    `<button class="btn" data-x3>Cancel</button><button class="btn primary" id="doImp">Import</button>`);
+  $('[data-x3]').onclick = closeModal;
+  $('#doImp').onclick = async () => {
+    const f = $('#csvf').files[0];
+    if (!f) return toast('Choose a file first', true);
+    const fd = new FormData(); fd.append('file', f);
+    try {
+      const r = await api.form('/api/groups/import', fd);
+      closeModal(); toast(`Added ${r.added}, updated ${r.updated}`); go('groups');
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+// ------------------------------------------------------------- campaigns
+VIEWS.campaigns = {
+  title: 'Campaigns', sub: 'Compose, target, schedule and execute',
+  async render(c) {
+    const d = await api.get('/api/campaigns?size=50');
+    c.innerHTML = `
+      <div class="toolbar">
+        <div style="font-size:12.5px;color:var(--text-secondary)"><strong>${n(d.total)}</strong> campaigns</div>
+        <div class="spacer"></div>
+
+      </div>
+      <div class="card"><div class="tbl-wrap"><table>
+        <thead><tr><th>Code</th><th>Campaign</th><th>Status</th><th>Channel</th>
+          <th class="num">Targets</th><th class="num">Reached</th><th class="num">Failed</th>
+          <th class="num">Pending</th><th>Created</th><th></th></tr></thead>
+        <tbody>${d.items.length ? d.items.map(r => `<tr>
+          <td class="mono">${esc(r.code)}</td><td>${esc(r.name)}</td>
+          <td>${statusPill(r.status)}</td><td><span class="pill">${esc(r.channel)}</span></td>
+          <td class="num">${n(r.targets)}</td><td class="num">${n(r.reached)}</td>
+          <td class="num">${n(r.failed)}</td><td class="num">${n(r.pending)}</td>
+          <td class="nowrap">${when(r.created_at)}</td>
+          <td class="right"><button class="btn sm" data-open="${r.id}">Open</button></td></tr>`).join('')
+          : '<tr><td colspan="10" class="empty">No campaigns yet.</td></tr>'}
+        </tbody></table></div></div>`;
+    $$('[data-open]', c).forEach(b => b.onclick = () => openCampaign(+b.dataset.open));
+    if (can('campaign.write')) {
+      setActions(`<button class="btn primary" id="newC">${icon('plus')} New campaign</button>`);
+      $('#newC').onclick = newCampaign;
+    }
+  }
+};
+
+async function newCampaign() {
+  const [facets, lists, tpls, chans] = await Promise.all([
+    api.get('/api/groups/facets'), api.get('/api/lists'),
+    api.get('/api/templates'), api.get('/api/channels')]);
+  modal('New campaign', `
+    <div class="steps">
+      <div class="step on">1. Compose</div><div class="step">2. Target</div>
+      <div class="step">3. Schedule</div></div>
+    <div class="field"><label>Campaign name</label><input id="cn" placeholder="Weekly community bulletin"></div>
+    <div class="field"><label>Start from a saved template</label>
+      <select id="ct"><option value="">Blank message</option>
+        ${tpls.templates.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('')}</select></div>
+    <div class="field"><label>Message body</label>
+      <textarea id="cb" placeholder="Type the message. Placeholders: {{group_name}}, {{campaign_name}}, {{link}}"></textarea></div>
+    <div class="field"><label>Link to track (optional)</label>
+      <input id="cl" placeholder="https://example.org/bulletin"></div>
+    <div class="note" style="margin-bottom:14px">Each group receives its own short link, which is
+      what makes click data attributable to an individual group (metric M4).</div>
+    <div class="grid g2">
+      <div class="field"><label>Target by</label>
+        <select id="cmode">
+          <option value="filter">Category, folder or tag</option>
+          <option value="list">Saved campaign list</option></select></div>
+      <div class="field"><label>Channel</label>
+        <select id="cch">${chans.channels.map(ch =>
+          `<option value="${ch.key}" ${ch.key === chans.active ? 'selected' : ''}>${esc(ch.label)}</option>`).join('')}</select></div>
+    </div>
+    <div id="filterBox" class="grid g3">
+      <div class="field"><label>Category</label><select id="ccat"><option value="">Any</option>
+        ${facets.categories.map(x => `<option value="${esc(x.value)}">${esc(x.value)} (${x.count})</option>`).join('')}</select></div>
+      <div class="field"><label>Folder</label><select id="cfold"><option value="">Any</option>
+        ${facets.folders.map(x => `<option value="${esc(x.value)}">${esc(x.value)} (${x.count})</option>`).join('')}</select></div>
+      <div class="field"><label>Tag</label><select id="ctag"><option value="">Any</option>
+        ${facets.tags.map(x => `<option value="${esc(x.value)}">${esc(x.value)} (${x.count})</option>`).join('')}</select></div>
+    </div>
+    <div id="listBox" class="field hidden"><label>Saved list</label>
+      <select id="clist">${lists.lists.map(l => `<option value="${l.id}">${esc(l.name)} (${l.count} groups)</option>`).join('')}</select></div>
+    <div class="grid g2">
+      <div class="field"><label>Schedule (leave blank to save as draft)</label>
+        <input id="csched" type="datetime-local"></div>
+      <div class="field"><label>Repeat</label>
+        <select id="crec"><option value="">Does not repeat</option>
+          <option value="hourly">Hourly</option><option value="daily">Daily</option>
+          <option value="weekly">Weekly</option></select></div>
+    </div>`,
+    `<button class="btn" data-x4>Cancel</button>
+     <button class="btn primary" id="csave">Create campaign</button>`);
+
+  $('[data-x4]').onclick = closeModal;
+  $('#ct').onchange = e => {
+    const t = tpls.templates.find(x => x.id == e.target.value);
+    if (t) { $('#cb').value = t.body; if (!$('#cn').value) $('#cn').value = t.name; }
+  };
+  $('#cmode').onchange = e => {
+    $('#filterBox').classList.toggle('hidden', e.target.value !== 'filter');
+    $('#listBox').classList.toggle('hidden', e.target.value !== 'list');
+  };
+  $('#csave').onclick = async () => {
+    const p = {
+      name: $('#cn').value.trim(), body: $('#cb').value,
+      link_url: $('#cl').value.trim(), channel: $('#cch').value,
+      recurrence: $('#crec').value,
+    };
+    if ($('#csched').value) p.scheduled_at = $('#csched').value;
+    if ($('#cmode').value === 'list') p.list_id = +$('#clist').value;
+    else {
+      p.category = $('#ccat').value; p.folder = $('#cfold').value; p.tag = $('#ctag').value;
+    }
+    try {
+      const r = await api.post('/api/campaigns', p);
+      closeModal();
+      toast(`${r.code} created with ${n(r.targets)} targets`);
+      openCampaign(r.id);
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+// ------------------------------------------------------- campaign detail
+async function openCampaign(id) {
+  S.campaign = id;
+  go('campaign');
+}
+
+VIEWS.campaign = {
+  title: 'Campaign', sub: '',
+  async render(c) {
+    const id = S.campaign;
+    setTabs([{ key: 'overview', label: 'Overview', icon: 'trend' },
+             { key: 'analytics', label: 'Snapshots and log', icon: 'clock' },
+             { key: 'deliveries', label: 'Delivery log', icon: 'list' }]);
+    const paint = async () => {
+      const [d, a] = await Promise.all([
+        api.get('/api/campaigns/' + id),
+        api.get(`/api/campaigns/${id}/analytics`)]);
+      const cm = d.campaign, m = a.metrics;
+      $('#viewTitle').textContent = cm.name;
+      setCrumbs([{ label: 'Dashboard', view: 'dashboard' }, { label: 'Campaigns', view: 'campaigns' }, { label: cm.code }]);
+      $('#viewSub').textContent = `${n(cm.targets)} target groups on the ${cm.channel} channel`;
+
+      if (!$('#cdWrap', c)) {
+        c.innerHTML = `<div id="cdWrap"></div>`;
+      }
+      $('#cdWrap', c).innerHTML = `
+        <div class="toolbar">
+          ${statusPill(cm.status)}
+          <div class="spacer"></div>
+          ${can('campaign.execute') ? `
+            ${['draft', 'scheduled'].includes(cm.status) ? '<button class="btn primary sm" data-act="launch">Launch now</button>' : ''}
+            ${cm.status === 'running' ? '<button class="btn sm" data-act="pause">Pause</button>' : ''}
+            ${cm.status === 'paused' ? '<button class="btn sm" data-act="resume">Resume</button>' : ''}
+            ${['running', 'paused'].includes(cm.status) ? '<button class="btn danger sm" data-act="cancel">Cancel</button>' : ''}
+            ${m.M2_failures > 0 ? '<button class="btn sm" data-act="retry-failed">Retry failed</button>' : ''}
+            ${['completed', 'partially_failed'].includes(cm.status) ? '<button class="btn sm" data-act="snapshot-now">Force all snapshots</button>' : ''}` : ''}
+          ${can('report.export') ? `
+            <a class="btn sm" href="/api/reports/campaign/${id}.xlsx">Excel</a>
+            <a class="btn sm" href="/api/reports/campaign/${id}.csv">CSV</a>
+            <a class="btn sm" href="/api/reports/campaign/${id}.pdf">PDF</a>` : ''}
+        </div>
+
+        <div class="grid g4" style="margin-bottom:14px" data-tab="overview">
+          ${tile('M1 groups reached', n(m.M1_groups_reached), pct(m.M1_reach_pct) + ' of targets')}
+          ${tile('M9 groups read', n(m.M9_groups_read), pct(m.M9_read_pct_of_reached) + ' of reached')}
+          ${tile('M4 link clicks', n(m.M4_clicks), n(m.M4_groups_clicked) + ' groups, CTR ' + pct(m.M4_ctr_pct))}
+          ${tile('M2 failures', n(m.M2_failures), pct(m.M2_failure_pct) + ' of targets')}
+        </div>
+
+        <div class="grid g21" data-tab="overview">
+          <div class="card">
+            <h2>Despatch progression</h2>
+            <div class="cap">Sent, delivered and read over the life of the campaign</div>
+            <div id="tsChart"><div class="empty">Awaiting despatch</div></div>
+          </div>
+          <div class="card">
+            <h2>Outcome</h2>
+            <div class="cap">Status data, labelled</div>
+            <div id="stWrap"></div>
+            <h2 style="margin-top:16px">Message preview</h2>
+            <div class="cap">As one group receives it</div>
+            <div class="log" style="max-height:150px;white-space:pre-wrap">${esc(cm.rendered_preview)}</div>
+          </div>
+        </div>
+
+        <div class="grid g2" data-tab="analytics">
+          <div class="card">
+            <h2>Interval snapshots</h2>
+            <div class="cap">Immutable at 15 minutes, 1 hour, 3 hours and 8 hours after despatch completes</div>
+            <div id="snapChart"></div>
+            <div id="snapTbl" style="margin-top:12px"></div>
+          </div>
+          <div class="card">
+            <h2>Operational log</h2>
+            <div class="cap">Live event stream</div>
+            <div class="log" id="evLog"></div>
+          </div>
+        </div>
+
+        <div class="card" data-tab="deliveries">
+          <h2>Per group delivery log</h2>
+          <div class="cap">One row per group: the success and failure record required by FR-15</div>
+          <div class="toolbar">
+            <select id="dstat"><option value="">All outcomes</option>
+              <option value="read">Read</option><option value="delivered">Delivered</option>
+              <option value="sent">Sent, awaiting delivery</option>
+              <option value="queued">Queued</option><option value="failed">Failed</option></select>
+          </div>
+          <div id="delivTbl"></div>
+        </div>`;
+
+      // charts
+      if (a.timeseries && a.timeseries.length) {
+        lineChart($('#tsChart', c), {
+          labels: a.timeseries.map(p => Math.round(p.offset_sec) + 's'),
+          series: [
+            { name: 'Sent', values: a.timeseries.map(p => p.sent) },
+            { name: 'Delivered', values: a.timeseries.map(p => p.delivered) },
+            { name: 'Read', values: a.timeseries.map(p => p.read) }],
+          yLabel: 'Groups, cumulative, by seconds since campaign start',
+        });
+      }
+      statusBar($('#stWrap', c), [
+        { label: 'Reached', value: m.M1_groups_reached, color: css('--good'), icon: '✓' },
+        { label: 'Pending', value: m.M3_pending, color: css('--warning'), icon: '○' },
+        { label: 'Failed', value: m.M2_failures, color: css('--critical'), icon: '✕' },
+      ]);
+
+      const snaps = a.snapshots;
+      if (snaps.length) {
+        barChart($('#snapChart', c), {
+          groups: snaps.map(s => s.label),
+          series: [
+            { name: 'Groups read', values: snaps.map(s => s.M9_groups_read || 0) },
+            { name: 'Link clicks', values: snaps.map(s => s.M4_clicks || 0) }],
+          yLabel: 'Measured at each interval after despatch completed',
+        });
+      } else {
+        $('#snapChart', c).innerHTML = '<div class="empty">Snapshots are taken once despatch completes.</div>';
+      }
+      $('#snapTbl', c).innerHTML = `<div class="tbl-wrap"><table>
+        <thead><tr><th>Interval</th><th>Status</th><th class="num">Reached</th><th class="num">Read</th>
+          <th class="num">Clicks</th><th class="num">Replies</th><th class="num">Engagement</th></tr></thead>
+        <tbody>${a.schedule.map(sc => {
+          const s = snaps.find(x => x.label === sc.label);
+          return `<tr><td><strong>${esc(sc.label)}</strong>
+            <div style="font-size:10.5px;color:var(--text-muted)">nominal ${sc.nominal_interval_seconds}s &rarr; ${sc.effective_interval_seconds}s here</div></td>
+            <td>${sc.taken ? '<span class="pill good">✓ taken</span>' : (sc.due_at ? '<span class="pill warn">◷ due ' + when(sc.due_at) + '</span>' : '<span class="pill">awaiting despatch</span>')}</td>
+            <td class="num">${s ? n(s.M1_groups_reached) : '—'}</td>
+            <td class="num">${s ? n(s.M9_groups_read) : '—'}</td>
+            <td class="num">${s ? n(s.M4_clicks) : '—'}</td>
+            <td class="num">${s ? n(s.M6_replies) : '—'}</td>
+            <td class="num">${s ? s.M7_engagement_index : '—'}</td></tr>`;
+        }).join('')}</tbody></table></div>`;
+
+      $$('[data-act]', c).forEach(b => b.onclick = async () => {
+        b.disabled = true;
+        try {
+          const act = b.dataset.act;
+          await api.post(`/api/campaigns/${id}/${act === 'launch' ? 'launch' : act}`);
+          toast('Done: ' + act);
+        } catch (e) { toast(e.message, true); }
+        paint();
+      });
+      loadDeliveries(id, $('#dstat', c).value);
+      $('#dstat', c).onchange = e => loadDeliveries(id, e.target.value);
+      loadEvents(id);
+    };
+
+    await paint();
+    every(2500, async () => {
+      const d = await api.get('/api/campaigns/' + S.campaign);
+      if (['running', 'paused'].includes(d.campaign.status) || S.pollMore) { paint(); }
+      else { loadEvents(S.campaign); refreshSnaps(S.campaign); }
+    });
+  }
+};
+
+async function refreshSnaps(id) {
+  try {
+    const a = await api.get(`/api/campaigns/${id}/analytics`);
+    const el = $('#snapChart');
+    if (el && a.snapshots.length) {
+      barChart(el, {
+        groups: a.snapshots.map(s => s.label),
+        series: [
+          { name: 'Groups read', values: a.snapshots.map(s => s.M9_groups_read || 0) },
+          { name: 'Link clicks', values: a.snapshots.map(s => s.M4_clicks || 0) }],
+        yLabel: 'Measured at each interval after despatch completed',
+      });
+    }
+  } catch (e) { /* view changed */ }
+}
+
+async function loadDeliveries(id, status) {
+  const el = $('#delivTbl');
+  if (!el) return;
+  const d = await api.get(`/api/campaigns/${id}/deliveries?size=150&status=${status || ''}`);
+  el.innerHTML = `<div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px">
+      Showing ${d.items.length} of ${n(d.total)}</div>
+    <div class="tbl-wrap" style="max-height:420px"><table>
+    <thead><tr><th>Group</th><th>Category</th><th class="num">Members</th><th>Outcome</th>
+      <th class="num">Attempts</th><th class="num">Member reads</th><th>Error</th><th class="mono">Message id</th></tr></thead>
+    <tbody>${d.items.map(r => `<tr>
+      <td>${esc(r.group)}</td><td>${esc(r.category)}</td><td class="num">${n(r.members)}</td>
+      <td>${deliveryPill(r.status)}</td><td class="num">${r.attempts}</td>
+      <td class="num">${r.status === 'read' ? n(r.member_reads) : '—'}</td>
+      <td>${r.error_code ? `<span class="pill crit">${r.error_code}</span> ${esc(r.error)}` : '—'}</td>
+      <td class="mono">${esc((r.message_id || '—').slice(0, 22))}</td></tr>`).join('')}
+    </tbody></table></div>`;
+}
+
+const deliveryPill = (s) => ({
+  read: '<span class="pill good">✓✓ read</span>',
+  delivered: '<span class="pill good">✓ delivered</span>',
+  sent: '<span class="pill info">↗ sent</span>',
+  queued: '<span class="pill warn">○ queued</span>',
+  failed: '<span class="pill crit">✕ failed</span>',
+}[s] || `<span class="pill">${esc(s)}</span>`);
+
+async function loadEvents(id) {
+  const el = $('#evLog');
+  if (!el) return;
+  const d = await api.get('/api/events?campaign_id=' + id + '&limit=60');
+  el.innerHTML = d.events.map(e =>
+    `<div><span class="t">${new Date(e.ts).toLocaleTimeString('en-IN')}</span>
+     <span class="${e.level}">${esc(e.message)}</span></div>`).join('') ||
+    '<div class="t">No events yet.</div>';
+  el.scrollTop = el.scrollHeight;
+}
+
+
+// ----------------------------------------------------------- group detail
+function openGroup(id) { S.group = id; go('group'); }
+
+const ago = (iso) => {
+  if (!iso) return '\u2014';
+  const s = (Date.now() - new Date(iso + (iso.endsWith('Z') ? '' : 'Z')).getTime()) / 1000;
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + ' min ago';
+  if (s < 86400) return Math.floor(s / 3600) + ' h ago';
+  return Math.floor(s / 86400) + ' d ago';
+};
+const whenZ = (iso) => iso ? when(iso + (iso.endsWith('Z') ? '' : 'Z')) : '\u2014';
+
+VIEWS.group = {
+  title: 'Group', sub: '',
+  async render(c) {
+    const id = S.group;
+    const d = await api.get(`/api/groups/${id}/insights`);
+    const g = d.group, pr = d.profile, a = d.activity, cv = d.coverage, k = d.sow_metrics;
+    const live = g.source === 'linked_device';
+    $('#viewTitle').textContent = g.name;
+    $('#viewSub').textContent = live ? 'Live group on your linked WhatsApp account'
+                                     : 'Demo group with no WhatsApp counterpart';
+    setCrumbs([{ label: 'Dashboard', view: 'dashboard' }, { label: 'Groups', view: 'groups' }, { label: g.name }]);
+
+    const top = (d.top_senders_30d || []).slice(0, 4).map(t => ({ name: t.sender }));
+    setActions((top.length ? avatarStack(top, Math.max(0, (a.active_members_7d || 0) - top.length)) : '') +
+      (live && can('group.write') ? `<button class="btn" id="gRefresh">${icon('refresh')} Refresh</button>` : '') +
+      (live ? `<button class="btn primary" id="gChat">${icon('message')} Open chat</button>` : ''));
+    setTabs([
+      { key: 'overview', label: 'Overview', icon: 'trend' },
+      { key: 'messages', label: 'Messages', icon: 'message' },
+      { key: 'yours', label: 'Your messages', icon: 'eye' },
+      { key: 'campaigns', label: 'Campaigns', icon: 'megaphone' },
+      { key: 'members', label: 'Members', icon: 'users' }],
+      live && can('group.write') ? `<button class="btn" id="gHistory">${icon('history')} Load older messages</button>` : '',
+      (key) => { if (key === 'members') loadMembers(id); if (key === 'messages') loadGroupMessages(id, null, true); });
+
+    const prev = a.messages_prev_7d || 0, cur = a.messages_7d || 0;
+    const delta = prev ? Math.round(100 * (cur - prev) / prev) : null;
+    const members = g.member_count || 0;
+    const otherText = Math.max(0, (a.messages_30d || 0) - (a.your_messages_30d || 0) - (a.member_media_30d || 0));
+    const tagPills = [g.category ? dotPill(g.category, css('--series-1')) : '',
+      ...(g.tags || []).map(t => dotPill(t, css('--series-3')))].join('') ||
+      '<span class="muted-sm">No tags yet</span>';
+
+    c.innerHTML = `
+    ${!live ? `<div class="note warn" style="margin-bottom:14px"><strong>This is a seeded demo group.</strong>
+      It has no WhatsApp counterpart, so there are no messages or members to show.</div>` : ''}
+
+    <div data-tab="overview" class="grid g2">
+      <div class="col">
+        <div class="card">
+          <h2 data-icon="users">Group details</h2>
+          <div class="profile">
+            ${avatar(g.name, 64)}
+            <div style="min-width:0">
+              <div class="nm">${esc(g.name)} ${live ? '<span class="pill good">\u25CF Live</span>' : '<span class="pill">Demo</span>'}</div>
+              <div class="chips">
+                <span class="chip">${icon('users', 13)} ${n(members)} members</span>
+                <span class="chip">${icon('shield', 13)} ${pr ? n(pr.admins) : 0} admins</span>
+                ${pr && pr.community ? `<span class="chip">${icon('share', 13)} Community</span>` : ''}</div>
+            </div>
+          </div>
+          <div class="itabs">
+            <button class="itab active" data-it="basic">Basic information</button>
+            <button class="itab" data-it="desc">Description</button>
+            <button class="itab" data-it="cover">Data coverage</button></div>
+          <div class="fields" data-itp="basic">
+            ${fld('user', 'Name', esc(g.name))}
+            ${fld('calendar', 'Created', pr && pr.created ? dateY(pr.created) : '\u2014')}
+            ${fld('shield', 'Created by', esc(pr ? pr.owner || '\u2014' : '\u2014'))}
+            ${fld('card', 'WhatsApp ID', `<span class="mono">${esc(g.wa_group_id)}</span>`)}
+            ${fld('send', 'Who can send', pr ? (pr.only_admins_send ? 'Admins only' : 'All members') : '\u2014')}
+            ${fld('pencil', 'Who can edit info', pr ? (pr.only_admins_edit ? 'Admins only' : 'All members') : '\u2014')}
+            ${fld('clock', 'Disappearing messages', pr && pr.disappearing_seconds ? Math.round(pr.disappearing_seconds / 86400) + ' days' : 'Off')}
+            ${fld('activity', 'Last activity', a.last_activity ? ago(a.last_activity) : 'Nothing captured yet')}
+            <div class="fld full"><div class="lbl">${icon('hash', 14)} Tags</div><div style="margin-top:8px">${tagPills}</div></div>
+          </div>
+          <div class="hidden" data-itp="desc">${pr && pr.description
+            ? `<div style="white-space:pre-wrap;font-size:13.5px;line-height:1.6">${esc(pr.description)}</div>`
+            : '<div class="empty">This group has no description.</div>'}</div>
+          <div class="fields hidden" data-itp="cover">
+            ${fld('message', 'Messages stored', n(cv.messages_stored))}
+            ${fld('history', 'From history sync', n(cv.from_history_sync))}
+            ${fld('calendar', 'Earliest held', cv.first_captured ? dateY(cv.first_captured) : '\u2014')}
+            ${fld('clock', 'Latest held', cv.last_captured ? whenZ(cv.last_captured) : '\u2014')}
+            <div class="fld full"><div class="note">The platform sees what your linked account sees: messages from
+              the moment the bridge runs, plus older pages fetched from your phone. Data stays on this machine.</div></div>
+          </div>
+        </div>
+        <div class="card">
+          <h2 data-icon="activity">Message volume</h2>
+          <div class="cap">Members and you, per day</div>
+          <div id="gLine"></div>
+        </div>
+      </div>
+
+      <div class="col">
+        <div class="card">
+          <h2 data-icon="trend">Activity</h2>
+          <div class="kpi">${n(cur)} <span style="font-size:15px;font-weight:500;color:var(--text-secondary)">messages, 7 days</span></div>
+          <div class="kpi-sub">${delta == null ? 'No earlier week to compare with yet'
+            : `<span class="${delta >= 0 ? 'delta-up' : 'delta-down'}">${delta >= 0 ? '+' : ''}${delta}%</span> vs the previous 7 days`}</div>
+          <div id="gStep" style="margin-top:14px"></div>
+        </div>
+        <div class="card">
+          <h2 data-icon="clock">Participation</h2>
+          <p class="big-line">Active members, 7 days</p>
+          <p class="big-sub"><strong>${n(a.active_members_7d)}</strong> of ${n(members)} members posted${a.active_share_pct != null ? ` (${a.active_share_pct}%)` : ''}</p>
+          <div id="gSeg"></div>
+        </div>
+        <div class="card">
+          <h2 data-icon="folder">Campaign reach</h2>
+          <p class="big-sub" style="margin:0 0 4px">Campaigns that targeted this group</p>
+          <p class="big-line" style="margin-bottom:16px">${n(k.targeted)} campaigns, ${n(k.reached)} reached</p>
+          ${d.campaigns.length ? progressRows(d.campaigns.slice(0, 4).map(r => ({
+            label: r.code + '  ' + r.name,
+            pct: members > 1 ? 100 * (r.member_reads || 0) / (members - 1) : 0,
+            note: r.status === 'read' ? n(r.member_reads) + ' members read it' : 'Status: ' + r.status })))
+            : '<div class="empty">No campaign has targeted this group yet.</div>'}
+        </div>
+      </div>
+    </div>
+
+    <div data-tab="messages" class="card">
+      <h2>Recent messages</h2>
+      <div class="cap">Newest first. Numbers are partly masked; this data stays on this machine.</div>
+      <div id="gMsgs"><div class="empty"><span class="spin"></span></div></div>
+    </div>
+
+    <div data-tab="yours" class="card">
+      <h2>Your messages and who read them</h2>
+      <div class="cap">Read receipts exist only for messages you send. WhatsApp sends them to the sender and
+        nobody else, so no one can see who read another member's message.</div>
+      ${d.your_messages.length ? `<div class="tbl-wrap"><table>
+        <thead><tr><th>Sent</th><th>Message</th><th class="num">Delivered</th><th class="num">Read</th>
+          <th class="num">Read %</th><th class="num">Reactions</th><th class="num">Replies</th><th>Campaign</th><th></th></tr></thead>
+        <tbody>${d.your_messages.map(m => `<tr>
+          <td class="nowrap">${whenZ(m.ts)}</td>
+          <td>${m.type !== 'text' ? `<span class="chip">${esc(m.type)}</span>` : ''}${esc(m.text || '')}</td>
+          <td class="num">${m.receipts_seen ? n(m.delivered) : '\u2014'}</td>
+          <td class="num">${m.receipts_seen ? n(m.read) + ' of ' + n(m.recipients) : '\u2014'}</td>
+          <td class="num">${m.receipts_seen && m.read_pct != null ? m.read_pct + '%' : '\u2014'}</td>
+          <td class="num">${n(m.reactions)}</td><td class="num">${n(m.replies)}</td>
+          <td class="mono">${esc(m.campaign || '')}</td>
+          <td class="right">${m.receipts_seen ? `<button class="btn sm" data-rcpt="${esc(m.msg_id)}">Who read</button>` : ''}</td></tr>`).join('')}
+        </tbody></table></div>
+        <p class="hint">A dash means no receipt has arrived yet. Receipts are collected while the bridge runs.</p>`
+        : '<div class="empty">You have not sent a message to this group since the bridge started.</div>'}
+    </div>
+
+    <div data-tab="campaigns">
+      <div class="grid g4" style="margin-bottom:14px">
+        ${tile('Campaigns', n(k.targeted), n(k.reached) + ' reached, ' + n(k.failed) + ' failed, ' + n(k.pending) + ' pending')}
+        ${tile('Read', n(k.groups_read), n(k.member_reads) + ' member reads (M9)')}
+        ${tile('Link clicks', n(k.clicks), n(k.media_views) + ' tracked media views')}
+        ${tile('Interactions', n(k.replies + k.reactions), n(k.replies) + ' replies, ' + n(k.reactions) + ' reactions, ' + n(k.optouts) + ' opt-outs')}
+      </div>
+      <div class="card">
+        <h2>Scope of Work metrics by campaign</h2>
+        <div class="cap">Every campaign that targeted this group</div>
+        ${d.campaigns.length ? `<div class="tbl-wrap"><table>
+          <thead><tr><th>Campaign</th><th>Channel</th><th>Outcome</th><th class="num">Member reads</th>
+            <th class="num">Clicks</th><th class="num">Replies</th><th class="num">Reactions</th><th>Sent</th><th>Error</th></tr></thead>
+          <tbody>${d.campaigns.map(r => `<tr data-cid="${r.campaign_id}" style="cursor:pointer">
+            <td><span class="mono">${esc(r.code)}</span> ${esc(r.name)}</td><td>${esc(r.channel)}</td>
+            <td>${deliveryPill(r.status)}</td><td class="num">${n(r.member_reads)}</td>
+            <td class="num">${n(r.clicks)}</td><td class="num">${n(r.replies)}</td><td class="num">${n(r.reactions)}</td>
+            <td class="nowrap">${whenZ(r.sent_at)}</td>
+            <td>${r.error_code ? `<span class="pill crit">${r.error_code}</span> ${esc(r.error)}` : '\u2014'}</td></tr>`).join('')}
+          </tbody></table></div>` : '<div class="empty">No campaign has targeted this group yet.</div>'}
+      </div>
+    </div>
+
+    <div data-tab="members" class="card">
+      <h2>Members</h2>
+      <div class="cap">Admins first, then by activity over 30 days. Numbers are partly masked.</div>
+      <div id="gMembers"><div class="empty"><span class="spin"></span></div></div>
+    </div>`;
+
+    enhanceCards(c);
+    const stepCard = $('#gStep', c).closest('.card');
+    $('.ch-r', stepCard).innerHTML = `<span class="range">${icon('calendar')} Last 14 days</span>`;
+    const lbl = x => new Date(x.date + 'T00:00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
+    stepArea($('#gStep', c), { labels: a.daily.map(lbl), values: a.daily.map(x => x.messages),
+      seriesName: 'Messages', yLabel: 'Messages per day, all members', height: 190 });
+    lineChart($('#gLine', c), { labels: a.daily.map(lbl),
+      series: [{ name: 'Members', values: a.daily.map(x => x.members) },
+               { name: 'You', values: a.daily.map(x => x.mine) }],
+      yLabel: 'Messages per day', height: 210 });
+    segBar($('#gSeg', c), [
+      { label: 'Your messages', value: a.your_messages_30d || 0, color: css('--series-1') },
+      { label: 'Member text', value: otherText, color: css('--series-2') },
+      { label: 'Member media', value: a.member_media_30d || 0, color: css('--series-3') }]);
+    innerTabs(c);
+
+    $$('[data-cid]', c).forEach(r => r.onclick = () => openCampaign(+r.dataset.cid));
+    $$('[data-rcpt]', c).forEach(b => b.onclick = () => receiptModal(b.dataset.rcpt));
+    const oc = $('#gChat'); if (oc) oc.onclick = () => { S.chat.gid = id; go('chats'); };
+    const rf = $('#gRefresh');
+    if (rf) rf.onclick = async () => {
+      rf.disabled = true;
+      try { await api.post(`/api/groups/${id}/refresh`); toast('Profile refreshed'); go('group', { replace: true }); }
+      catch (e) { toast(e.message, true); rf.disabled = false; }
+    };
+    const hb = $('#gHistory');
+    if (hb) hb.onclick = async () => {
+      hb.disabled = true;
+      try {
+        await api.post(`/api/groups/${id}/history`);
+        toast('Requested 50 older messages from your phone. They appear in a few seconds.');
+        setTimeout(() => { if (S.view === 'group') loadGroupMessages(id, null, true); }, 6000);
+      } catch (e) { toast(e.message, true); } finally { hb.disabled = false; }
+    };
+    if (S.tab === 'messages') loadGroupMessages(id, null, true);
+    if (S.tab === 'members') loadMembers(id);
+    every(8000, () => { if (S.view === 'group' && S.tab === 'messages' && !S.msgPaged) loadGroupMessages(id, null, true); });
+  }
+};
+
+function dateY(iso) {
+  const d = new Date(iso + (iso.endsWith('Z') ? '' : 'Z'));
+  return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+}
+
+async function loadMembers(id) {
+  const el = $('#gMembers');
+  if (!el || el.dataset.loaded) return;
+  const d = await api.get(`/api/groups/${id}/members`);
+  el.dataset.loaded = '1';
+  el.innerHTML = d.members.length ? `<div class="tbl-wrap" style="max-height:560px"><table>
+    <thead><tr><th>Member</th><th>Role</th><th class="num">Messages, 30 days</th><th>Last seen</th></tr></thead>
+    <tbody>${d.members.map(m => `<tr>
+      <td><div style="display:flex;align-items:center;gap:10px">${avatar(m.member, 28)}
+        <div>${esc(m.member)}<div class="mono" style="color:var(--text-muted)">${esc(m.id)}</div></div></div></td>
+      <td>${m.role === 'member' ? '<span class="pill">Member</span>' : `<span class="pill info">${m.role === 'superadmin' ? 'Owner' : 'Admin'}</span>`}</td>
+      <td class="num">${n(m.messages_30d)}</td><td class="nowrap">${m.last_seen ? ago(m.last_seen) : '\u2014'}</td></tr>`).join('')}
+    </tbody></table></div>` : '<div class="empty">No member list synced. Use Refresh.</div>';
+}
+
+async function loadGroupMessages(id, before, replace) {
+  const el = $('#gMsgs');
+  if (!el) return;
+  S.msgPaged = !!before;
+  const d = await api.get(`/api/groups/${id}/messages?limit=40` + (before ? '&before=' + encodeURIComponent(before) : ''));
+  const rows = d.items.map(m => `
+    <div style="padding:9px 2px;border-top:1px solid var(--rule-soft)">
+      <div style="display:flex;gap:8px;align-items:baseline">
+        <strong style="font-size:12.5px;${m.from_me ? 'color:var(--blue)' : ''}">${esc(m.sender)}</strong>
+        ${!m.from_me && m.sender_id && m.sender_id !== m.sender ? `<span class="mono" style="color:var(--text-muted)">${esc(m.sender_id)}</span>` : ''}
+        ${m.type !== 'text' ? `<span class="chip">${esc(m.type)}</span>` : ''}
+        ${m.history ? '<span class="chip" title="Fetched through history sync">history</span>' : ''}
+        <span class="spacer"></span>
+        <span style="font-size:11px;color:var(--text-muted)" class="nowrap">${whenZ(m.ts)}</span>
+      </div>
+      ${m.quoted ? `<div style="margin:4px 0 2px;padding:4px 8px;border-left:3px solid var(--sky);background:var(--surface-2);border-radius:0 6px 6px 0;font-size:11.5px;color:var(--text-secondary)">
+        <strong>${esc(m.quoted[0])}</strong>: ${esc(m.quoted[1])}</div>` : ''}
+      <div style="font-size:13px;white-space:pre-wrap;word-break:break-word;margin-top:2px">${esc(m.text) || '<span style="color:var(--text-muted)">(no text)</span>'}</div>
+      <div style="display:flex;gap:10px;margin-top:3px;font-size:11.5px;color:var(--text-muted)">
+        ${m.reactions.length ? `<span>${m.reactions.map(esc).join(' ')}</span>` : ''}
+        ${m.from_me ? `<span>${m.read ? '\u2713\u2713 read by ' + n(m.read) : (m.delivered ? '\u2713\u2713 delivered to ' + n(m.delivered) : '\u2713 sent')}</span>` : ''}
+        ${m.from_me && (m.read || m.delivered) ? `<a href="#" data-rcpt="${esc(m.msg_id)}">who read</a>` : ''}
+      </div>
+    </div>`).join('');
+  const more = d.next_before ? `<div style="text-align:center;padding-top:10px">
+      <button class="btn sm" id="gMore">Older</button></div>` : '';
+  if (replace || !before) el.innerHTML = `<div style="max-height:520px;overflow:auto" id="gMsgScroll">${rows || '<div class="empty">No messages captured yet.</div>'}</div>${more}`;
+  else { $('#gMsgScroll').insertAdjacentHTML('beforeend', rows); const old = $('#gMore'); if (old) old.parentElement.remove(); el.insertAdjacentHTML('beforeend', more); }
+  $$('[data-rcpt]', el).forEach(b => b.onclick = (e) => { e.preventDefault(); receiptModal(b.dataset.rcpt); });
+  const mb = $('#gMore');
+  if (mb) mb.onclick = () => loadGroupMessages(id, d.next_before, false);
+}
+
+async function receiptModal(msgId) {
+  const d = await api.get(`/api/messages/${encodeURIComponent(msgId)}/receipts`);
+  const read = d.receipts.filter(r => r.read_at), deliv = d.receipts.filter(r => !r.read_at && r.delivered_at);
+  const list = (rows, key) => rows.length ? `<div class="tbl-wrap"><table>
+      <thead><tr><th>Member</th><th>${key === 'read_at' ? 'Read' : 'Delivered'}</th></tr></thead>
+      <tbody>${rows.map(r => `<tr><td>${esc(r.member)}</td><td class="nowrap">${whenZ(r[key])}</td></tr>`).join('')}</tbody></table></div>`
+    : '<div class="empty" style="padding:14px">None</div>';
+  modal('Message info', `
+    <h2 style="font-size:13px;margin-bottom:6px">\u2713\u2713 Read by ${read.length}</h2>${list(read, 'read_at')}
+    <h2 style="font-size:13px;margin:14px 0 6px">\u2713\u2713 Delivered to ${deliv.length}, not yet read</h2>${list(deliv, 'delivered_at')}
+    <p class="hint">Members with read receipts switched off still appear here: WhatsApp always
+      sends read receipts in group chats.</p>`);
+}
+
+// --------------------------------------------------------------- reports
+VIEWS.reports = {
+  title: 'Reports', sub: 'Exports in Excel, CSV and PDF',
+  async render(c) {
+    const d = await api.get('/api/campaigns?size=100');
+    c.innerHTML = `
+      <div class="card" style="margin-bottom:14px">
+        <h2>Master data</h2><div class="cap">The full group register</div>
+        <div class="btn-row">
+          <a class="btn" href="/api/reports/groups.xlsx">Groups, Excel</a>
+          <a class="btn" href="/api/reports/groups.csv">Groups, CSV</a></div>
+      </div>
+      <div class="card">
+        <h2>Campaign reports</h2>
+        <div class="cap">Each export carries the summary, the interval snapshots, the per group log and the failure analysis</div>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>Code</th><th>Campaign</th><th>Status</th><th class="num">Targets</th><th>Exports</th></tr></thead>
+          <tbody>${d.items.length ? d.items.map(r => `<tr>
+            <td class="mono">${esc(r.code)}</td><td>${esc(r.name)}</td>
+            <td>${statusPill(r.status)}</td><td class="num">${n(r.targets)}</td>
+            <td><div class="btn-row">
+              <a class="btn sm" href="/api/reports/campaign/${r.id}.xlsx">Excel</a>
+              <a class="btn sm" href="/api/reports/campaign/${r.id}.csv">CSV</a>
+              <a class="btn sm" href="/api/reports/campaign/${r.id}.pdf">PDF</a></div></td></tr>`).join('')
+            : '<tr><td colspan="5" class="empty">No campaigns to report on yet.</td></tr>'}
+          </tbody></table></div>
+      </div>`;
+  }
+};
+
+// ----------------------------------------------------------- feasibility
+const FEAS = [
+  ['M1', 'Groups successfully reached', 'Feasible', 'Feasible',
+    'sent and delivered status webhooks; the delivery engine records each group at despatch'],
+  ['M2', 'Delivery failures', 'Feasible', 'Feasible',
+    'failed status with a numeric error code, error title and detail'],
+  ['M3', 'Pending deliveries', 'Feasible', 'Feasible',
+    'derived from the gap between a sent and a delivered status. The one metric with no dedicated field'],
+  ['M9', 'Read statistics', 'Feasible', 'Feasible, detail confirmed in Week 1',
+    'WhatsApp always sends read receipts in group chats. The official API returns a read status aggregated per group'],
+  ['M4', 'Link clicks', 'Feasible for template URL buttons', 'Feasible',
+    'Template Analytics reports url_button and unique_url_button. Body links are not counted, so the platform issues a tracked short link per group'],
+  ['M5', 'Media downloads and views', 'Not available', 'Feasible if delivered as a tracked link',
+    'no media metric exists in the template analytics enumeration. A direct attachment reports nothing back'],
+  ['M6', 'User interactions', 'Feasible', 'Feasible',
+    'replies from group participants trigger webhooks; captured and attributed to the campaign'],
+  ['M7', 'Engagement metrics', 'Feasible', 'Feasible',
+    'messaging, conversation and template analytics, plus a composite index over collected data'],
+  ['M8', 'Custom engagement metrics', 'Feasible', 'Feasible',
+    'computed over the platform event store. Definitions agreed at requirement analysis'],
+];
+
+VIEWS.feasibility = {
+  title: 'Feasibility', sub: 'What this build proves, and what it does not',
+  async render(c) {
+    let health = {};
+    try { health = (await api.get('/api/channels/cloud_api/health')).health; } catch (e) { }
+    c.innerHTML = `
+      <div class="note crit" style="margin-bottom:14px">
+        <strong>Read this first.</strong> The despatch channel in this proof of concept defaults to a
+        simulator. It sends nothing. It models the outcome distribution that a Week 1 proof of
+        concept would measure for real, so that the queue, the rate governor, the retry path, the
+        analytics pipeline and the snapshot engine can be exercised end to end. Every rate in it is
+        an assumption, not an observation.
+      </div>
+      <div class="card" style="margin-bottom:14px">
+        <h2>Why the official Groups API cannot serve this network</h2>
+        <div class="cap">Constraints published by Meta, read live from the adapter</div>
+        <ul style="margin:0;padding-left:18px;font-size:12.5px;color:var(--text-secondary);line-height:1.8">
+          ${(health.constraints || ['Adapter not reachable']).map(x => `<li>${esc(x)}</li>`).join('')}
+        </ul>
+        <div class="note" style="margin-top:12px">The conclusion is unchanged from the proposal:
+          existing groups cannot be adopted and eight participants per group could not carry this
+          network even if they were rebuilt. The reasoning, however, is that the Groups API
+          <strong>exists</strong> and is constrained, not that group messaging is impossible.</div>
+      </div>
+      <div class="card">
+        <h2>Metric by metric</h2>
+        <div class="cap">Identifiers match the feasibility table in the proposal and the report exports</div>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>Id</th><th>Requested metric</th><th>Official Groups API</th>
+            <th>This platform</th><th>Basis</th></tr></thead>
+          <tbody>${FEAS.map(r => `<tr>
+            <td class="mono"><strong>${r[0]}</strong></td><td>${esc(r[1])}</td>
+            <td>${r[2].startsWith('Not') ? '<span class="pill crit">✕ ' + esc(r[2]) + '</span>' : '<span class="pill good">✓ ' + esc(r[2]) + '</span>'}</td>
+            <td>${r[3].startsWith('Not') ? '<span class="pill crit">✕ ' + esc(r[3]) + '</span>' : '<span class="pill good">✓ ' + esc(r[3]) + '</span>'}</td>
+            <td style="color:var(--text-secondary)">${esc(r[4])}</td></tr>`).join('')}
+          </tbody></table></div>
+      </div>`;
+  }
+};
+
+// -------------------------------------------------------------- channels
+VIEWS.channels = {
+  title: 'Channels', sub: 'Despatch routes and their readiness',
+  async render(c) {
+    const chans = await api.get('/api/channels');
+    c.innerHTML = `<div class="grid g3" id="chWrap"></div>`;
+    for (const ch of chans.channels) {
+      const h = (await api.get(`/api/channels/${ch.key}/health`)).health;
+      const el = document.createElement('div');
+      el.className = 'card';
+      el.innerHTML = `
+        <div style="display:flex;align-items:flex-start;gap:8px">
+          <div style="flex:1"><h2>${esc(ch.key)}</h2>
+            <div class="cap">${esc(ch.label)}</div></div>
+          ${h.ready ? '<span class="pill good">✓ ready</span>' : '<span class="pill warn">○ not ready</span>'}
+        </div>
+        <dl class="kv" style="margin-bottom:10px">
+          <dt>Sends real messages</dt><dd>${h.sends_real_messages ? '<strong>Yes</strong>' : 'No, simulated'}</dd>
+          <dt>Existing groups</dt><dd>${ch.can_address_existing_groups ? 'Can address' : '<strong>Cannot address</strong>'}</dd>
+        </dl>
+        ${(h.constraints || []).length ? `<div class="note warn"><strong>Constraints</strong><ul style="margin:6px 0 0;padding-left:16px">${h.constraints.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>` : ''}
+        ${(h.warnings || []).length ? `<div class="note crit" style="margin-top:8px"><strong>Warnings</strong><ul style="margin:6px 0 0;padding-left:16px">${h.warnings.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>` : ''}
+        ${(h.notes || []).length ? `<div class="note" style="margin-top:8px">${h.notes.map(esc).join('<br>')}</div>` : ''}
+        ${ch.can_address_existing_groups && ch.key !== 'simulator' && can('group.write')
+          ? `<div class="btn-row" style="margin-top:10px"><button class="btn sm" data-imp="${ch.key}">Import groups from this channel</button></div>` : ''}`;
+      $('#chWrap', c).appendChild(el);
+    }
+    $$('[data-imp]', c).forEach(b => b.onclick = async () => {
+      b.disabled = true; b.textContent = 'Importing…';
+      try {
+        const r = await api.post(`/api/channels/${b.dataset.imp}/import-groups`);
+        toast(`Discovered ${r.discovered}, added ${r.added}` +
+          (r.updated != null ? `, refreshed ${r.updated} (${n(r.members)} members)` : ''));
+      } catch (e) { toast(e.message, true); }
+      b.disabled = false; b.textContent = 'Import groups from this channel';
+    });
+  }
+};
+
+// ----------------------------------------------------------------- users
+VIEWS.users = {
+  title: 'Users', sub: 'Role based access control',
+  async render(c) {
+    const d = await api.get('/api/users');
+    c.innerHTML = `
+      <div class="toolbar"><div class="spacer"></div>
+</div>
+      <div class="card" style="margin-bottom:14px"><div class="tbl-wrap"><table>
+        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>State</th><th>Last sign in</th><th></th></tr></thead>
+        <tbody>${d.users.map(u => `<tr><td>${esc(u.name)}</td><td class="mono">${esc(u.email)}</td>
+          <td><span class="pill info">${esc(u.role.replace(/_/g, ' '))}</span></td>
+          <td>${u.active ? '<span class="pill good">✓ active</span>' : '<span class="pill crit">✕ disabled</span>'}</td>
+          <td class="nowrap">${when(u.last_login)}</td>
+          <td class="right">${can('user.write') ? `<button class="btn sm" data-tog="${u.id}" data-on="${u.active}">${u.active ? 'Disable' : 'Enable'}</button>` : ''}</td></tr>`).join('')}
+        </tbody></table></div></div>
+      <div class="card"><h2>Permission matrix</h2>
+        <div class="cap">Every route declares a permission; the matrix decides. Denials are written to the audit trail.</div>
+        <div class="tbl-wrap"><table><thead><tr><th>Permission</th>
+          ${d.roles.map(r => `<th>${esc(r.replace(/_/g, ' '))}</th>`).join('')}</tr></thead>
+          <tbody>${[...new Set(Object.values(d.permissions).flat())].sort().map(p =>
+            `<tr><td class="mono">${esc(p)}</td>${d.roles.map(r =>
+              `<td>${d.permissions[r].includes(p) ? '<span style="color:var(--good);font-weight:700">✓</span>' : '<span style="color:var(--text-muted)">—</span>'}</td>`).join('')}</tr>`).join('')}
+          </tbody></table></div></div>`;
+    $$('[data-tog]', c).forEach(b => b.onclick = async () => {
+      await api.patch('/api/users/' + b.dataset.tog, { active: b.dataset.on !== 'true' });
+      go('users');
+    });
+    if (can('user.write')) setActions(`<button class="btn primary" id="nu">${icon('userPlus')} Invite user</button>`);
+    const nu = $('#nu');
+    if (nu) nu.onclick = () => {
+      modal('Add user', `
+        <div class="field"><label>Name</label><input id="un"></div>
+        <div class="field"><label>Email</label><input id="ue" type="email"></div>
+        <div class="field"><label>Password</label><input id="up" type="password"></div>
+        <div class="field"><label>Role</label><select id="ur">
+          ${d.roles.map(r => `<option value="${r}">${esc(r.replace(/_/g, ' '))}</option>`).join('')}</select></div>`,
+        `<button class="btn" data-x5>Cancel</button><button class="btn primary" id="usave">Create</button>`);
+      $('[data-x5]').onclick = closeModal;
+      $('#usave').onclick = async () => {
+        try {
+          await api.post('/api/users', {
+            name: $('#un').value, email: $('#ue').value,
+            password: $('#up').value, role: $('#ur').value
+          });
+          closeModal(); toast('User created'); go('users');
+        } catch (e) { toast(e.message, true); }
+      };
+    };
+  }
+};
+
+// ----------------------------------------------------------------- audit
+VIEWS.audit = {
+  title: 'Audit trail', sub: 'User actions, campaign changes and administrative events',
+  async render(c) {
+    const d = await api.get('/api/audit?limit=300');
+    c.innerHTML = `<div class="card"><div class="tbl-wrap" style="max-height:74vh"><table>
+      <thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Entity</th><th>Detail</th><th>IP</th></tr></thead>
+      <tbody>${d.entries.map(a => `<tr><td class="nowrap">${when(a.ts)}</td>
+        <td class="mono">${esc(a.actor)}</td>
+        <td><span class="pill ${a.action.includes('denied') || a.action.includes('failed') ? 'crit' : ''}">${esc(a.action)}</span></td>
+        <td>${esc(a.entity)}${a.entity_id ? ' #' + esc(a.entity_id) : ''}</td>
+        <td style="color:var(--text-secondary)">${esc(a.detail)}</td>
+        <td class="mono">${esc(a.ip)}</td></tr>`).join('')}
+      </tbody></table></div></div>`;
+  }
+};
+
+// ----------------------------------------------------------------- shell
+const NAV = [
+  { key: 'workspace', label: 'Workspace', icon: 'dashboard', items: [
+    { view: 'dashboard', label: 'Overview' }] },
+  { key: 'messaging', label: 'Messaging', icon: 'message', items: [
+    { view: 'groups', label: 'Groups', count: 'groups' },
+    { view: 'chats', label: 'Chats', count: 'chats' }] },
+  { key: 'campaigns', label: 'Campaigns', icon: 'megaphone', items: [
+    { view: 'campaigns', label: 'Campaigns', count: 'campaigns' },
+    { view: 'reports', label: 'Reports' }] },
+  { key: 'analysis', label: 'Analysis', icon: 'chart', items: [
+    { view: 'feasibility', label: 'Feasibility' }] },
+  { key: 'admin', label: 'Administration', icon: 'shield', items: [
+    { view: 'channels', label: 'Channels' },
+    { view: 'users', label: 'Users', count: 'users', perm: 'user.read' },
+    { view: 'audit', label: 'Audit trail', perm: 'audit.read' }] },
+];
+const PARENT = { campaign: 'campaigns', group: 'groups' };
+S.counts = {}; S.hist = []; S.tab = null;
+
+const sectionOf = (view) => NAV.find(sec => sec.items.some(i => i.view === (PARENT[view] || view)));
+const visibleItems = (sec) => sec.items.filter(i => !i.perm || can(i.perm));
+
+function renderRail() {
+  const cur = sectionOf(S.view);
+  $('#railItems').innerHTML = NAV.filter(sec => visibleItems(sec).length).map(sec =>
+    `<button class="rail-btn ${cur && cur.key === sec.key ? 'active' : ''}" data-sec="${sec.key}"
+       title="${esc(sec.label)}" aria-label="${esc(sec.label)}">${icon(sec.icon, 19)}</button>`).join('');
+  $$('[data-sec]', $('#railItems')).forEach(b => b.onclick = () => {
+    const sec = NAV.find(x => x.key === b.dataset.sec);
+    go(visibleItems(sec)[0].view);
+  });
+}
+
+const ITEM_ICON = { dashboard: 'dashboard', groups: 'users', chats: 'message', campaigns: 'megaphone',
+  reports: 'file', feasibility: 'check', channels: 'share', users: 'shield', audit: 'list' };
+
+// --- persisted preferences --------------------------------------------------
+const pref = {
+  get(k, d) { try { const v = localStorage.getItem('wdap-' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem('wdap-' + k, JSON.stringify(v)); } catch (e) { } },
+};
+S.sidebar = pref.get('sidebar', true);
+S.live = pref.get('live', true);
+S.foldedSecs = pref.get('folded', []);
+
+function renderSubnav() {
+  const active = PARENT[S.view] || S.view;
+  const linked = S.counts.linked;
+  const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+  $('#subnav').innerHTML = `<div class="subnav-inner">
+    <div class="subnav-head">
+      <span class="brand-chip">${LOGO}</span>
+      <div class="sh-t"><strong>Dissemination</strong><small>Gsure Technologies</small></div>
+      <button class="icon-btn sm" id="snClose" title="Hide sidebar (Ctrl+B)" aria-label="Hide sidebar">${icon('panelClose', 17)}</button>
+    </div>
+
+    <div class="sn-scroll">
+    ${NAV.map(sec => {
+      const items = visibleItems(sec);
+      if (!items.length) return '';
+      const folded = S.foldedSecs.includes(sec.key) && !items.some(i => i.view === active);
+      return `<div class="nav-group ${folded ? 'folded' : ''}">
+        <button class="nav-label" data-fold="${sec.key}" aria-expanded="${!folded}">
+          <span>${esc(sec.label)}</span>${icon('chevronDown', 14)}</button>
+        <div class="nav-items"><div>
+        ${items.map(it => {
+          const c = it.count ? S.counts[it.count] : null;
+          const hot = it.view === 'chats' && c;
+          return `<button class="nav-item ${active === it.view ? 'active' : ''}" data-view="${it.view}">
+            <span class="ni">${icon(ITEM_ICON[it.view] || 'hash', 17)}</span>
+            <span class="nl">${esc(it.label)}</span>
+            ${c ? `<span class="count ${hot ? 'hot' : ''}" title="${hot ? 'Groups with messages in the last 24 hours' : ''}">${n(c)}</span>` : ''}</button>`;
+        }).join('')}</div></div></div>`;
+    }).join('')}
+    </div>
+
+    <div class="sn-card ${linked ? 'on' : 'off'}">
+      <div class="sn-card-top">
+        <span class="sn-ico">${icon('phone', 16)}</span>
+        <div style="min-width:0;flex:1">
+          <div class="sn-status"><i class="${linked ? 'pulse' : ''}"></i>${linked ? 'WhatsApp linked' : 'WhatsApp not linked'}</div>
+          <div class="sn-acct">${linked ? esc(S.counts.account || 'Linked device') : 'Link a number to go live'}</div>
+        </div>
+      </div>
+      ${linked ? `<div class="sn-stats"><span><strong>${n(S.counts.groups || 0)}</strong> groups</span>
+          <span><strong>${n(S.counts.chats || 0)}</strong> active today</span></div>`
+        : `<button class="btn sm primary" id="snLink" style="width:100%;margin-top:10px">${icon('share', 14)} Link WhatsApp</button>`}
+    </div>
+
+    <div class="sn-switches">
+      <div class="sw-row">
+        <span class="sw-ic">${icon(dark ? 'moon' : 'sun', 16)}</span>
+        <div class="sw-t"><div>Dark mode</div><small>${dark ? 'On' : 'Off'}</small></div>
+        ${switchHtml('swDark', dark, 'Dark mode')}
+      </div>
+      <div class="sw-row">
+        <span class="sw-ic">${icon(S.live ? 'activity' : 'pause', 16)}</span>
+        <div class="sw-t"><div>Live updates</div><small>${S.live ? 'Refreshing automatically' : 'Paused'}</small></div>
+        ${switchHtml('swLive', S.live, 'Live updates')}
+      </div>
+    </div>
+  </div>`;
+
+  const root = $('#subnav');
+  $$('.nav-item', root).forEach(b => b.onclick = () => go(b.dataset.view));
+  $$('[data-fold]', root).forEach(b => b.onclick = () => {
+    const k = b.dataset.fold, grp = b.parentElement;
+    const nowFolded = !grp.classList.contains('folded');
+    grp.classList.toggle('folded', nowFolded);
+    b.setAttribute('aria-expanded', String(!nowFolded));
+    S.foldedSecs = nowFolded ? [...new Set([...S.foldedSecs, k])] : S.foldedSecs.filter(x => x !== k);
+    pref.set('folded', S.foldedSecs);
+  });
+  $('#snClose').onclick = () => setSidebar(false);
+  const lk = $('#snLink'); if (lk) lk.onclick = () => go('channels');
+  $('#swDark').onclick = () => { applyTheme(dark ? 'light' : 'dark'); go(S.view, { replace: true }); };
+  $('#swLive').onclick = () => setLive(!S.live);
+}
+
+// --- sidebar show / hide ----------------------------------------------------
+const isNarrow = () => matchMedia('(max-width: 900px)').matches;
+
+function setSidebar(on, silent) {
+  const app = $('#app');
+  if (isNarrow()) {
+    app.classList.toggle('drawer', on);
+  } else {
+    S.sidebar = on;
+    pref.set('sidebar', on);
+    app.classList.toggle('sn-off', !on);
+    // charts measure their container, so repaint once the width has settled
+    if (!silent) setTimeout(() => { if (S.view && S.view !== 'chats') go(S.view, { replace: true }); }, 300);
+  }
+  const t = $('#snToggle');
+  const shown = isNarrow() ? app.classList.contains('drawer') : on;
+  t.innerHTML = icon(shown ? 'panelClose' : 'panelOpen', 18);
+  t.title = (shown ? 'Hide' : 'Show') + ' sidebar (Ctrl+B)';
+  t.setAttribute('aria-pressed', String(shown));
+}
+
+function setLive(on) {
+  S.live = on;
+  pref.set('live', on);
+  $('#livePaused').classList.toggle('hidden', on);
+  renderSubnav();
+  if (on) { refreshCounts(); if (S.bellCheck) S.bellCheck(); go(S.view, { replace: true }); }
+  toast(on ? 'Live updates on' : 'Live updates paused. Pages stay as they are until you refresh.');
+}
+
+$('#snToggle').onclick = () => setSidebar(isNarrow() ? !$('#app').classList.contains('drawer') : !S.sidebar);
+$('#snBackdrop').onclick = () => setSidebar(false);
+$('#livePaused').onclick = () => setLive(true);
+document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b' && !e.shiftKey) {
+    e.preventDefault();
+    $('#snToggle').click();
+  }
+});
+
+async function refreshCounts() {
+  try {
+    const c = await api.get('/api/nav-counts');
+    Object.assign(S.counts, c);
+    try {
+      const h = (await api.get('/api/channels/linked_device/health')).health;
+      S.counts.linked = !!h.ready;
+      S.counts.account = ((h.bridge || {}).user || {}).name || '';
+    } catch (e) { }
+    renderSubnav();
+  } catch (e) { }
+}
+
+function setCrumbs(parts) {
+  $('#crumbs').innerHTML = parts.map((p, i) => {
+    const last = i === parts.length - 1;
+    return (i ? '<span class="sep">/</span>' : '') +
+      (last ? `<span class="cur">${esc(p.label)}</span>` : `<a data-cv="${p.view || ''}">${esc(p.label)}</a>`);
+  }).join('');
+  $$('[data-cv]', $('#crumbs')).forEach(a => a.onclick = () => a.dataset.cv && go(a.dataset.cv));
+}
+
+function setActions(html) { $('#pageActions').innerHTML = html || ''; }
+
+function setTabs(tabs, rightHtml, onChange) {
+  const el = $('#pageTabs');
+  if (!tabs) { el.innerHTML = ''; S.tab = null; return; }
+  if (!S.tab || !tabs.some(t => t.key === S.tab)) S.tab = tabs[0].key;
+  el.innerHTML = tabs.map(t => `<button class="ptab ${t.key === S.tab ? 'active' : ''}" data-tabk="${t.key}">
+      ${icon(t.icon, 16)} ${esc(t.label)}</button>`).join('') +
+    (rightHtml ? `<div class="tab-right">${rightHtml}</div>` : '');
+  $$('[data-tabk]', el).forEach(b => b.onclick = () => {
+    S.tab = b.dataset.tabk;
+    $$('[data-tabk]', el).forEach(x => x.classList.toggle('active', x === b));
+    enhanceCards($('#content'));
+    if (onChange) onChange(S.tab);
+  });
+}
+
+function innerTabs(root) {
+  $$('.itabs', root).forEach(bar => {
+    const card = bar.closest('.card');
+    $$('.itab', bar).forEach(t => t.onclick = () => {
+      $$('.itab', bar).forEach(x => x.classList.toggle('active', x === t));
+      $$('[data-itp]', card).forEach(p => p.classList.toggle('hidden', p.dataset.itp !== t.dataset.it));
+    });
+  });
+}
+
+function fld(ic, label, valueHtml) {
+  return `<div class="fld"><div class="lbl">${icon(ic, 14)} ${esc(label)}</div><div class="val">${valueHtml}</div></div>`;
+}
+
+function avatarStack(people, extra) {
+  const shown = (people || []).slice(0, 4);
+  const more = (extra != null ? extra : Math.max(0, (people || []).length - shown.length));
+  return `<div class="avatar-stack" title="${esc(shown.map(p => p.name).join(', '))}">
+    ${shown.map(p => avatar(p.name, 32)).join('')}${more ? `<span class="more">+${more}</span>` : ''}</div>`;
+}
+
+function inviteModal() {
+  const roles = ['SUPER_ADMIN', 'CAMPAIGN_MANAGER', 'ANALYST', 'VIEWER'];
+  modal('Invite a user', `
+    <div class="field"><label>Name</label><input id="un"></div>
+    <div class="field"><label>Email</label><input id="ue" type="email"></div>
+    <div class="field"><label>Temporary password</label><input id="up" type="password"></div>
+    <div class="field"><label>Role</label><select id="ur">
+      ${roles.map(r => `<option value="${r}" ${r === 'VIEWER' ? 'selected' : ''}>${esc(r.replace(/_/g, ' '))}</option>`).join('')}</select></div>`,
+    `<button class="btn" data-xi>Cancel</button><button class="btn primary" id="isave">${icon('userPlus')} Invite</button>`);
+  $('[data-xi]').onclick = closeModal;
+  $('#isave').onclick = async () => {
+    try {
+      await api.post('/api/users', { name: $('#un').value, email: $('#ue').value,
+                                     password: $('#up').value, role: $('#ur').value });
+      closeModal(); toast('User invited'); refreshCounts();
+      if (S.view === 'users' || S.view === 'dashboard') go(S.view, { replace: true });
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+async function go(view, opts) {
+  opts = opts || {};
+  clearTimers();
+  if (!opts.back && !opts.replace && S.view && (S.view !== view || view === 'group' || view === 'campaign')) {
+    S.hist.push({ view: S.view, campaign: S.campaign, group: S.group });
+    if (S.hist.length > 40) S.hist.shift();
+  }
+  if (S.view !== view || !opts.replace) S.tab = null;
+  S.view = view;
+  const v = VIEWS[view];
+  if (!v) return;
+  $('#viewTitle').textContent = v.title;
+  $('#viewSub').textContent = v.sub || '';
+  $('#pageHead').classList.toggle('bare', !!v.bare);
+  setActions(''); setTabs(null);
+  $('#app').classList.remove('drawer');
+  const sec = sectionOf(view);
+  const trail = [{ label: 'Dashboard', view: 'dashboard' }];
+  if (view === 'dashboard') trail.push({ label: 'Overview' });
+  else {
+    if (sec && sec.key !== 'workspace') trail.push({ label: sec.label, view: visibleItems(sec)[0].view });
+    trail.push({ label: v.title });
+  }
+  setCrumbs(trail);
+  renderRail(); renderSubnav();
+  $('#backBtn').disabled = !S.hist.length;
+  const c = $('#content');
+  c.innerHTML = '<div class="empty"><span class="spin"></span></div>';
+  try { await v.render(c); }
+  catch (e) { c.innerHTML = `<div class="card"><div class="err">${esc(e.message)}</div></div>`; }
+  enhanceCards(c);
+  window.scrollTo(0, 0);
+}
+
+// cards repainted by a view on a timer still get the reference header
+new MutationObserver(() => requestAnimationFrame(() => enhanceCards($('#content'))))
+  .observe($('#content'), { childList: true, subtree: true });
+
+$('#backBtn').innerHTML = `${icon('back', 16)} Back`;
+$('#backBtn').onclick = () => {
+  const prev = S.hist.pop();
+  if (!prev) return;
+  S.campaign = prev.campaign; S.group = prev.group;
+  go(prev.view, { back: true });
+};
+
+// ------------------------------------------------------------ command search
+(function commandSearch() {
+  const inp = $('#cmdInput'), menu = $('#cmdMenu');
+  $('#cmdIcon').innerHTML = icon('search', 16);
+  let deb, items = [], sel = 0;
+  const close = () => { menu.classList.remove('on'); sel = 0; };
+  const paint = (sections) => {
+    items = [];
+    menu.innerHTML = sections.filter(sx => sx.rows.length).map(sx => `<div class="mh">${esc(sx.title)}</div>` +
+      sx.rows.map(r => { items.push(r); return `<button class="mi" data-i="${items.length - 1}">${icon(r.icon, 16)}
+        <span class="ms"><span>${esc(r.label)}</span>${r.sub ? `<small>${esc(r.sub)}</small>` : ''}</span></button>`; }).join('')
+    ).join('') || '<div class="empty" style="padding:16px">No matches</div>';
+    menu.classList.add('on');
+    $$('[data-i]', menu).forEach(b => b.onmousedown = (e) => { e.preventDefault(); items[+b.dataset.i].go(); close(); inp.value = ''; });
+    highlight();
+  };
+  const highlight = () => $$('[data-i]', menu).forEach(b => b.classList.toggle('sel', +b.dataset.i === sel));
+  const search = async (q) => {
+    const pages = NAV.flatMap(sx => visibleItems(sx).map(i => ({ ...i, sec: sx.label })))
+      .filter(i => i.label.toLowerCase().includes(q.toLowerCase()))
+      .map(i => ({ icon: 'dashboard', label: i.label, sub: i.sec, go: () => go(i.view) }));
+    let groups = [], camps = [];
+    try {
+      const [g, c] = await Promise.all([
+        api.get('/api/groups?size=6&source=linked_device&q=' + encodeURIComponent(q)),
+        api.get('/api/campaigns?size=5&q=' + encodeURIComponent(q))]);
+      groups = g.items.map(x => ({ icon: 'users', label: x.name, sub: n(x.member_count) + ' members',
+        go: () => openGroup(x.id) }));
+      camps = c.items.map(x => ({ icon: 'megaphone', label: x.name, sub: x.code + ' \u00b7 ' + x.status,
+        go: () => openCampaign(x.id) }));
+    } catch (e) { }
+    if (inp.value.trim() !== q) return;
+    paint([{ title: 'Your groups', rows: groups }, { title: 'Campaigns', rows: camps }, { title: 'Pages', rows: pages }]);
+  };
+  inp.addEventListener('input', () => {
+    clearTimeout(deb);
+    const q = inp.value.trim();
+    if (!q) return close();
+    deb = setTimeout(() => search(q), 180);
+  });
+  inp.addEventListener('keydown', (e) => {
+    if (!menu.classList.contains('on')) return;
+    if (e.key === 'ArrowDown') { sel = Math.min(items.length - 1, sel + 1); highlight(); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { sel = Math.max(0, sel - 1); highlight(); e.preventDefault(); }
+    else if (e.key === 'Enter' && items[sel]) { items[sel].go(); close(); inp.value = ''; inp.blur(); }
+    else if (e.key === 'Escape') { close(); inp.blur(); }
+  });
+  inp.addEventListener('blur', () => setTimeout(close, 120));
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); inp.focus(); inp.select(); }
+  });
+})();
+
+// ------------------------------------------------------------------ bell
+(function bell() {
+  const btn = $('#bellBtn'), menu = $('#bellMenu');
+  btn.innerHTML = icon('bell', 18) + '<span class="dot hidden" id="bellDot"></span>';
+  const lastSeen = () => { try { return +localStorage.getItem('wdap-last-ev') || 0; } catch (e) { return 0; } };
+  const check = async () => {
+    if (!S.user) return;
+    try {
+      const d = await api.get('/api/events?limit=12');
+      S.events = d.events;
+      const top = d.events.length ? d.events[d.events.length - 1].id : 0;
+      $('#bellDot').classList.toggle('hidden', !(top > lastSeen()));
+    } catch (e) { }
+  };
+  btn.onclick = async (e) => {
+    e.stopPropagation();
+    if (menu.classList.contains('on')) return menu.classList.remove('on');
+    await check();
+    const ev = (S.events || []).slice().reverse();
+    menu.innerHTML = `<div class="mh">Recent activity</div>` + (ev.length ? ev.map(x => `
+      <div class="mi" style="cursor:default;align-items:flex-start">
+        <span style="margin-top:6px;width:8px;height:8px;border-radius:50%;flex:none;background:${
+          x.level === 'error' ? css('--critical') : x.level === 'warn' ? css('--warning') : css('--good')}"></span>
+        <span class="ms"><span style="white-space:normal">${esc(x.message)}</span>
+          <small>${esc(when(x.ts + (x.ts.endsWith('Z') ? '' : 'Z')))}${x.campaign_id ? ' \u00b7 campaign ' + x.campaign_id : ''}</small></span></div>`).join('')
+      : '<div class="empty" style="padding:16px">Nothing yet</div>');
+    menu.classList.add('on');
+    if (ev.length) { try { localStorage.setItem('wdap-last-ev', ev[0].id); } catch (e2) { } }
+    $('#bellDot').classList.add('hidden');
+  };
+  document.addEventListener('click', (e) => { if (!menu.contains(e.target)) menu.classList.remove('on'); });
+  setInterval(() => { if (S.live !== false) check(); }, 20000);
+  S.bellCheck = check;
+})();
+
+// ------------------------------------------------------------ account menu
+function applyTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  try { localStorage.setItem('wdap-theme', t); } catch (e) { }
+}
+try {
+  const t = localStorage.getItem('wdap-theme');
+  if (t) document.documentElement.setAttribute('data-theme', t);
+} catch (e) { }
+
+$('#railMe').onclick = (e) => {
+  e.stopPropagation();
+  const m = $('#meMenu');
+  if (m.classList.contains('on')) return m.classList.remove('on');
+  const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+  m.innerHTML = `
+    <div style="display:flex;gap:10px;align-items:center;padding:8px 10px">${avatar(S.user.name, 36)}
+      <div><div style="font-weight:600">${esc(S.user.name)}</div>
+      <div class="muted-sm">${esc(S.user.role.replace(/_/g, ' '))}</div></div></div>
+    <hr>
+    <button class="mi" id="mTheme">${icon('moon')} ${dark ? 'Light' : 'Dark'} theme</button>
+    <button class="mi" id="mOut">${icon('logout')} Sign out</button>`;
+  m.classList.add('on');
+  $('#mTheme').onclick = () => { applyTheme(dark ? 'light' : 'dark'); m.classList.remove('on'); go(S.view, { replace: true }); };
+  // keep the sidebar switch in step with the menu
+  $('#mOut').onclick = async () => { m.classList.remove('on'); await api.post('/api/auth/logout'); showLogin(); };
+};
+document.addEventListener('click', (e) => { const m = $('#meMenu'); if (!m.contains(e.target)) m.classList.remove('on'); });
+
+$('#railLogo').innerHTML = LOGO;
+$('#loginLogo').innerHTML = LOGO;
+$('#railSettings').innerHTML = icon('sliders', 19);
+$('#railHelp').innerHTML = icon('help', 19);
+$('#railSettings').onclick = () => go('channels');
+$('#railHelp').onclick = () => go('feasibility');
+
+function showLogin() {
+  clearTimers();
+  $('#app').classList.remove('on');
+  $('#login').style.display = 'grid';
+}
+
+async function boot() {
+  try {
+    const me = await api.get('/api/auth/me');
+    S.user = me.user;
+    S.sys = await api.get('/api/system');
+  } catch (e) { return showLogin(); }
+  $('#login').style.display = 'none';
+  $('#app').classList.add('on');
+  $('#railMe').innerHTML = avatar(S.user.name, 34);
+  setSidebar(S.sidebar, true);
+  $('#livePaused').classList.toggle('hidden', S.live);
+  S.hist = []; S.view = null;
+  await refreshCounts();
+  if (S.bellCheck) S.bellCheck();
+  go('dashboard', { replace: true });
+  setInterval(() => { if (S.live !== false) refreshCounts(); }, 30000);
+}
+
+$('#loginForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const err = $('#loginErr');
+  err.classList.add('hidden');
+  try {
+    await api.post('/api/auth/login', { email: $('#email').value, password: $('#password').value });
+    boot();
+  } catch (ex) {
+    err.textContent = ex.message; err.classList.remove('hidden');
+  }
+};
+
+// Boot once every script has loaded, so views registered by chats.js exist.
+window.addEventListener('DOMContentLoaded', boot);

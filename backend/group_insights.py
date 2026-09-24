@@ -1,0 +1,300 @@
+# -*- coding: utf-8 -*-
+"""Per group view: profile, activity, recent messages, the read status of
+this account's own messages, and every Scope of Work metric for the campaigns
+that targeted the group.
+
+What is and is not knowable, stated once so the interface can repeat it:
+  - Read status exists only for messages this account sent. WhatsApp sends
+    read receipts to the sender and nobody else, so no client, including
+    WhatsApp itself, can show who read another member's message.
+  - Message history covers what the linked account has observed: messages
+    since linking, plus older pages fetched on demand from the phone.
+"""
+import datetime as dt
+
+from sqlalchemy import select, func, desc
+
+from db import (SessionLocal, Group, GroupMeta, GroupMember, WaMessage, WaReceipt,
+                WaReaction, Campaign, Delivery, LinkEvent, MediaEvent, Interaction,
+                utcnow)
+
+MEDIA_TYPES = {"image", "video", "audio", "document", "sticker", "ptv",
+               "documentWithCaption"}
+
+
+def mask(jid: str, me: str = "") -> str:
+    """Show enough of a number to tell members apart, not enough to copy it."""
+    if not jid:
+        return ""
+    if me and jid.split(":")[0].split("@")[0] == me.split(":")[0].split("@")[0]:
+        return "You"
+    user = jid.split("@")[0].split(":")[0]
+    if jid.endswith("@lid"):
+        return f"private id ..{user[-4:]}"
+    if user.isdigit() and len(user) > 6:
+        return f"+{user[:2]} ....{user[-4:]}"
+    return user[:3] + "..."
+
+
+def _label(mtype: str) -> str:
+    return {"conversation": "text", "extendedText": "text", "documentWithCaption": "document",
+            "ptv": "video note", "poll CreationV3": "poll"}.get(mtype, mtype or "text")
+
+
+def insights(group_id: int, me_jid: str = "") -> dict | None:
+    now = utcnow()
+    d1, d7, d14, d30 = (now - dt.timedelta(days=n) for n in (1, 7, 14, 30))
+    with SessionLocal() as s:
+        g = s.get(Group, group_id)
+        if g is None:
+            return None
+        meta = s.get(GroupMeta, group_id)
+        base = select(WaMessage).where(WaMessage.group_id == group_id)
+
+        def count(*conds):
+            return s.scalar(select(func.count()).select_from(WaMessage).where(
+                WaMessage.group_id == group_id, *conds)) or 0
+
+        total = count()
+        first_ts = s.scalar(select(func.min(WaMessage.ts)).where(WaMessage.group_id == group_id))
+        last_ts = s.scalar(select(func.max(WaMessage.ts)).where(WaMessage.group_id == group_id))
+        members = g.member_count or 0
+        active7 = s.scalar(select(func.count(func.distinct(WaMessage.sender_jid))).where(
+            WaMessage.group_id == group_id, WaMessage.ts >= d7,
+            WaMessage.from_me.is_(False))) or 0
+
+        # daily volume, 14 days, zero filled so the chart has no gaps
+        daily_rows = dict(s.execute(
+            select(func.date(WaMessage.ts), func.count())
+            .where(WaMessage.group_id == group_id, WaMessage.ts >= d14)
+            .group_by(func.date(WaMessage.ts))).all())
+        mine_rows = dict(s.execute(
+            select(func.date(WaMessage.ts), func.count())
+            .where(WaMessage.group_id == group_id, WaMessage.ts >= d14,
+                   WaMessage.from_me.is_(True))
+            .group_by(func.date(WaMessage.ts))).all())
+        daily = []
+        for i in range(13, -1, -1):
+            day = (now - dt.timedelta(days=i)).date().isoformat()
+            tot, mine = int(daily_rows.get(day, 0)), int(mine_rows.get(day, 0))
+            daily.append({"date": day, "messages": tot, "mine": mine, "members": tot - mine})
+
+        hourly_rows = dict(s.execute(
+            select(func.strftime("%H", WaMessage.ts), func.count())
+            .where(WaMessage.group_id == group_id, WaMessage.ts >= d30)
+            .group_by(func.strftime("%H", WaMessage.ts))).all())
+        hourly = [{"hour_utc": h, "messages": int(hourly_rows.get(f"{h:02d}", 0))}
+                  for h in range(24)]
+
+        # WhatsApp has two internal types for plain text; merge after labelling.
+        merged: dict[str, int] = {}
+        for t, n in s.execute(select(WaMessage.mtype, func.count()).where(
+                WaMessage.group_id == group_id, WaMessage.ts >= d30)
+                .group_by(WaMessage.mtype)).all():
+            merged[_label(t)] = merged.get(_label(t), 0) + n
+        mix = [{"type": k, "count": v} for k, v in
+               sorted(merged.items(), key=lambda kv: -kv[1])]
+
+        top = []
+        for jid, name, n, last in s.execute(
+                select(WaMessage.sender_jid, func.max(WaMessage.sender_name), func.count(),
+                       func.max(WaMessage.ts))
+                .where(WaMessage.group_id == group_id, WaMessage.ts >= d30)
+                .group_by(WaMessage.sender_jid).order_by(func.count().desc()).limit(10)).all():
+            top.append({"sender": name or mask(jid, me_jid), "id": mask(jid, me_jid),
+                        "messages": n, "last_seen": last.isoformat() if last else None})
+
+        # this account's own messages: the only ones with read receipts
+        own = []
+        for m in s.scalars(base.where(WaMessage.from_me.is_(True))
+                           .order_by(desc(WaMessage.ts)).limit(15)):
+            camp = s.get(Campaign, m.campaign_id) if m.campaign_id else None
+            recipients = max(0, members - 1)
+            own.append({
+                "msg_id": m.msg_id, "ts": m.ts.isoformat(), "type": _label(m.mtype),
+                "text": m.text[:220], "delivered": m.delivered_count, "read": m.read_count,
+                "recipients": recipients,
+                "read_pct": round(100 * m.read_count / recipients, 1) if recipients else None,
+                "reactions": m.reaction_count, "replies": m.reply_count,
+                "campaign": camp.code if camp else None,
+                "status": m.status or "sent",
+                "receipts_seen": m.delivered_count > 0 or m.read_count > 0,
+            })
+
+        # Scope of Work metrics for campaigns that targeted this group
+        campaigns = []
+        agg = {"targeted": 0, "reached": 0, "failed": 0, "pending": 0, "groups_read": 0,
+               "member_reads": 0, "clicks": 0, "media_views": 0, "replies": 0,
+               "reactions": 0, "optouts": 0}
+        for d, c in s.execute(select(Delivery, Campaign)
+                              .join(Campaign, Campaign.id == Delivery.campaign_id)
+                              .where(Delivery.group_id == group_id)
+                              .order_by(desc(Delivery.id)).limit(50)).all():
+            clicks = s.scalar(select(func.count()).select_from(LinkEvent).where(
+                LinkEvent.campaign_id == c.id, LinkEvent.group_id == group_id)) or 0
+            views = s.scalar(select(func.count()).select_from(MediaEvent).where(
+                MediaEvent.campaign_id == c.id, MediaEvent.group_id == group_id)) or 0
+            inter = dict(s.execute(select(Interaction.kind, func.count()).where(
+                Interaction.campaign_id == c.id, Interaction.group_id == group_id)
+                .group_by(Interaction.kind)).all())
+            campaigns.append({
+                "campaign_id": c.id, "code": c.code, "name": c.name, "channel": c.channel,
+                "status": d.status, "attempts": d.attempts, "member_reads": d.read_count,
+                "error_code": d.error_code, "error": d.error_title,
+                "sent_at": d.sent_at.isoformat() if d.sent_at else None,
+                "delivered_at": d.delivered_at.isoformat() if d.delivered_at else None,
+                "read_at": d.read_at.isoformat() if d.read_at else None,
+                "clicks": clicks, "media_views": views,
+                "replies": inter.get("reply", 0), "reactions": inter.get("reaction", 0),
+                "optouts": inter.get("optout", 0),
+            })
+            agg["targeted"] += 1
+            agg["reached"] += d.status in ("delivered", "read")
+            agg["failed"] += d.status == "failed"
+            agg["pending"] += d.status in ("queued", "sent")
+            agg["groups_read"] += d.status == "read"
+            agg["member_reads"] += d.read_count or 0
+            agg["clicks"] += clicks
+            agg["media_views"] += views
+            agg["replies"] += inter.get("reply", 0)
+            agg["reactions"] += inter.get("reaction", 0)
+            agg["optouts"] += inter.get("optout", 0)
+
+        roles = dict(s.execute(select(GroupMember.role, func.count())
+                               .where(GroupMember.group_id == group_id)
+                               .group_by(GroupMember.role)).all())
+
+    return {
+        "group": {**g.as_dict()},
+        "profile": {
+            "description": meta.description if meta else "",
+            "created": meta.wa_created_at.isoformat() if meta and meta.wa_created_at else None,
+            "owner": mask(meta.owner_jid, me_jid) if meta else "",
+            "only_admins_send": bool(meta and meta.announce),
+            "only_admins_edit": bool(meta and meta.restrict),
+            "disappearing_seconds": meta.ephemeral_seconds if meta else 0,
+            "community": bool(meta and meta.is_community),
+            "admins": roles.get("admin", 0) + roles.get("superadmin", 0),
+            "synced_at": meta.synced_at.isoformat() if meta else None,
+        } if meta or roles else None,
+        "coverage": {
+            "messages_stored": total,
+            "from_history_sync": count(WaMessage.from_history.is_(True)),
+            "first_captured": first_ts.isoformat() if first_ts else None,
+            "last_captured": last_ts.isoformat() if last_ts else None,
+        },
+        "activity": {
+            "last_activity": last_ts.isoformat() if last_ts else None,
+            "messages_24h": count(WaMessage.ts >= d1),
+            "messages_7d": count(WaMessage.ts >= d7),
+            "messages_30d": count(WaMessage.ts >= d30),
+            "messages_prev_7d": count(WaMessage.ts >= d14, WaMessage.ts < d7),
+            "your_messages_30d": count(WaMessage.ts >= d30, WaMessage.from_me.is_(True)),
+            "member_media_30d": count(WaMessage.ts >= d30, WaMessage.from_me.is_(False),
+                                      WaMessage.mtype.in_(tuple(MEDIA_TYPES))),
+            "your_messages_7d": count(WaMessage.ts >= d7, WaMessage.from_me.is_(True)),
+            "active_members_7d": active7,
+            "active_share_pct": round(100 * active7 / members, 1) if members else None,
+            "media_messages_30d": sum(m["count"] for m in mix if m["type"] in MEDIA_TYPES
+                                      or m["type"] in ("video note",)),
+            "daily": daily, "hourly_utc": hourly, "mix_30d": mix,
+        },
+        "top_senders_30d": top,
+        "your_messages": own,
+        "campaigns": campaigns,
+        "sow_metrics": agg,
+    }
+
+
+def messages(group_id: int, before: str | None, limit: int, me_jid: str = "") -> dict:
+    """Thread of one group, newest first."""
+    return _thread(WaMessage.group_id == group_id, before, limit, me_jid)
+
+
+def thread_for_chat(chat_jid: str, before: str | None, limit: int, me_jid: str = "") -> dict:
+    """Thread of one conversation by chat id: a group or one to one."""
+    return _thread(WaMessage.chat_jid == chat_jid, before, limit, me_jid)
+
+
+def _thread(where, before: str | None, limit: int, me_jid: str = "") -> dict:
+    limit = max(1, min(200, limit))
+    with SessionLocal() as s:
+        stmt = select(WaMessage).where(where)
+        if before:
+            try:
+                stmt = stmt.where(WaMessage.ts < dt.datetime.fromisoformat(before))
+            except ValueError:
+                pass
+        rows = list(s.scalars(stmt.order_by(desc(WaMessage.ts)).limit(limit)))
+        quoted = {}
+        qids = {m.quoted_id for m in rows if m.quoted_id}
+        if qids:
+            for q in s.scalars(select(WaMessage).where(WaMessage.msg_id.in_(qids))):
+                quoted[q.msg_id] = (q.sender_name or mask(q.sender_jid, me_jid), q.text[:80])
+        reacts = {}
+        ids = [m.msg_id for m in rows]
+        if ids:
+            for tid, emo in s.execute(select(WaReaction.target_msg_id, WaReaction.emoji)
+                                      .where(WaReaction.target_msg_id.in_(ids))).all():
+                reacts.setdefault(tid, []).append(emo)
+    return {"items": [{
+        "msg_id": m.msg_id, "ts": m.ts.isoformat(), "from_me": m.from_me,
+        "sender": "You" if m.from_me else (m.sender_name or mask(m.sender_jid, me_jid)),
+        "sender_id": mask(m.sender_jid, me_jid), "type": _label(m.mtype), "text": m.text,
+        "quoted": quoted.get(m.quoted_id) if m.quoted_id else None,
+        "reactions": reacts.get(m.msg_id, []),
+        "delivered": m.delivered_count if m.from_me else None,
+        "read": m.read_count if m.from_me else None,
+        "history": m.from_history,
+    } for m in rows],
+        "next_before": rows[-1].ts.isoformat() if len(rows) == limit else None}
+
+
+def receipts_for(msg_id: str, me_jid: str = "") -> list[dict]:
+    with SessionLocal() as s:
+        names = {}
+        m = s.scalar(select(WaMessage).where(WaMessage.msg_id == msg_id))
+        if m and m.group_id:
+            names = {gm.jid: gm.name for gm in s.scalars(
+                select(GroupMember).where(GroupMember.group_id == m.group_id))}
+        rows = list(s.scalars(select(WaReceipt).where(WaReceipt.msg_id == msg_id)
+                              .order_by(WaReceipt.read_at.is_(None), WaReceipt.read_at)))
+    return [{"member": names.get(r.participant) or mask(r.participant, me_jid),
+             "delivered_at": r.delivered_at.isoformat() if r.delivered_at else None,
+             "read_at": r.read_at.isoformat() if r.read_at else None} for r in rows]
+
+
+def oldest_anchor(group_id: int) -> dict | None:
+    with SessionLocal() as s:
+        m = s.scalar(select(WaMessage).where(WaMessage.group_id == group_id)
+                     .order_by(WaMessage.ts).limit(1))
+        if m is None:
+            return None
+        epoch = m.ts.replace(tzinfo=dt.timezone.utc).timestamp()
+        return {"jid": m.chat_jid, "id": m.msg_id, "from_me": m.from_me,
+                "ts_ms": int(epoch * 1000)}
+
+
+def members(group_id: int, me_jid: str = "") -> list[dict]:
+    """Member list with role and 30 day posting activity. Numbers are masked."""
+    since = utcnow() - dt.timedelta(days=30)
+    with SessionLocal() as s:
+        counts = {}
+        last = {}
+        for jid, n, ts in s.execute(
+                select(WaMessage.sender_jid, func.count(), func.max(WaMessage.ts))
+                .where(WaMessage.group_id == group_id, WaMessage.ts >= since)
+                .group_by(WaMessage.sender_jid)).all():
+            key = jid.split("@")[0].split(":")[0]
+            counts[key] = counts.get(key, 0) + n
+            last[key] = max(filter(None, [last.get(key), ts])) if last.get(key) else ts
+        rows = list(s.scalars(select(GroupMember).where(GroupMember.group_id == group_id)))
+    out = []
+    for m in rows:
+        key = m.jid.split("@")[0].split(":")[0]
+        out.append({"member": m.name or mask(m.jid, me_jid), "id": mask(m.jid, me_jid),
+                    "role": m.role, "messages_30d": counts.get(key, 0),
+                    "last_seen": last[key].isoformat() if key in last else None})
+    rank = {"superadmin": 0, "admin": 1, "member": 2}
+    out.sort(key=lambda r: (rank.get(r["role"], 3), -r["messages_30d"], r["member"]))
+    return out

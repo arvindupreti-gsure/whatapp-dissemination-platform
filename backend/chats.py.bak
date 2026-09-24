@@ -1,0 +1,110 @@
+# -*- coding: utf-8 -*-
+"""Group chat: read and reply to real groups from the platform instead of the
+WhatsApp app, through the linked account.
+
+This is conversational messaging, one message typed by one operator, and is
+kept separate from campaign despatch. It still goes out from the linked
+number, so it still counts against the account's standing with WhatsApp.
+A throttle protects against accidental floods, and every message is audited.
+"""
+import datetime as dt
+import time
+from collections import deque
+
+from sqlalchemy import select, func, desc
+
+from db import SessionLocal, Group, GroupMeta, GroupMember, WaMessage, utcnow
+
+# Manual sends: at most one every 2 seconds and 15 a minute, across the
+# platform. Generous for a person typing, too tight for a stuck key or script.
+MIN_GAP_SECONDS = 2.0
+MAX_PER_MINUTE = 15
+_recent: deque = deque()
+
+
+def throttle_check() -> str | None:
+    """Returns a reason string if a send must be refused right now."""
+    now = time.monotonic()
+    while _recent and now - _recent[0] > 60:
+        _recent.popleft()
+    if _recent and now - _recent[-1] < MIN_GAP_SECONDS:
+        return f"Please wait {MIN_GAP_SECONDS:.0f} seconds between messages."
+    if len(_recent) >= MAX_PER_MINUTE:
+        return f"Limit of {MAX_PER_MINUTE} messages a minute reached. This protects the account."
+    return None
+
+
+def throttle_record():
+    _recent.append(time.monotonic())
+
+
+def _num(jid: str) -> str:
+    return (jid or "").split("@")[0].split(":")[0]
+
+
+def my_role(group_id: int, me_jid: str) -> str | None:
+    """member, admin, superadmin, or None when membership cannot be confirmed."""
+    me = _num(me_jid)
+    if not me:
+        return None
+    with SessionLocal() as s:
+        for gm in s.scalars(select(GroupMember).where(GroupMember.group_id == group_id)):
+            if _num(gm.jid) == me:
+                return gm.role
+    return None
+
+
+def can_send(group_id: int, me_jid: str) -> tuple[bool, str]:
+    with SessionLocal() as s:
+        meta = s.get(GroupMeta, group_id)
+    role = my_role(group_id, me_jid)
+    if meta and meta.announce and role not in ("admin", "superadmin"):
+        return False, "Only admins can send messages in this group."
+    return True, ""
+
+
+def chat_list(me_jid: str) -> list[dict]:
+    """Every live group, most recently active first, with a preview line."""
+    out = []
+    with SessionLocal() as s:
+        groups = list(s.scalars(select(Group).where(Group.source == "linked_device")))
+        since = utcnow() - dt.timedelta(hours=24)
+        for g in groups:
+            last = s.scalar(select(WaMessage).where(WaMessage.group_id == g.id)
+                            .order_by(desc(WaMessage.ts)).limit(1))
+            today = s.scalar(select(func.count()).select_from(WaMessage).where(
+                WaMessage.group_id == g.id, WaMessage.ts >= since)) or 0
+            meta = s.get(GroupMeta, g.id)
+            preview = ""
+            if last is not None:
+                who = "You" if last.from_me else (last.sender_name or "Member")
+                body = last.text or f"[{last.mtype or 'message'}]"
+                preview = f"{who}: {body}"[:90]
+            out.append({
+                "group_id": g.id, "name": g.name, "members": g.member_count,
+                "last_ts": last.ts.isoformat() if last else None,
+                "preview": preview, "messages_24h": today,
+                "admins_only": bool(meta and meta.announce),
+            })
+    out.sort(key=lambda x: x["last_ts"] or "", reverse=True)
+    for item in out:
+        ok, _ = can_send(item["group_id"], me_jid)
+        item["can_send"] = ok
+    return out
+
+
+def record_sent(group_id: int, chat_jid: str, msg_id: str, text: str, mtype: str,
+                quoted_id: str, me_jid: str):
+    """Store the outgoing message at once so it appears without waiting for
+    the bridge to echo it back. The echo is then ignored as a duplicate."""
+    if not msg_id:
+        return
+    with SessionLocal() as s:
+        exists = s.scalar(select(WaMessage.id).where(WaMessage.chat_jid == chat_jid,
+                                                     WaMessage.msg_id == msg_id))
+        if exists:
+            return
+        s.add(WaMessage(msg_id=msg_id, chat_jid=chat_jid, group_id=group_id,
+                        sender_jid=me_jid, sender_name="You", from_me=True,
+                        ts=utcnow(), mtype=mtype, text=text[:2000], quoted_id=quoted_id or ""))
+        s.commit()

@@ -1,0 +1,626 @@
+/* Linked device bridge for the WhatsApp Dissemination & Analytics Platform.
+   Gsure Technologies Private Limited.
+
+   WHAT THIS IS
+   The official WhatsApp Groups API can only address groups it created itself,
+   caps them at 8 participants and offers no way to add a member. It therefore
+   cannot address a network of pre-existing community groups. This bridge takes
+   the other route: it operates an existing WhatsApp account as a linked device,
+   exactly as WhatsApp Web does, which is the only way to enumerate and message
+   the groups that account already belongs to.
+
+   READ BEFORE YOU RUN IT
+   - This is not covered by WhatsApp's published API terms.
+   - The account carries a restriction risk. This is risk R1 in the proposal.
+   - Run it only on a number whose owner has authorised it in writing.
+   - Rate governance lives in the platform, not here. Do not bypass it.
+
+   ENDPOINTS (all require the X-Bridge-Token header except /qr)
+     GET  /health   connection state
+     GET  /qr       QR code page, scan once to link the account
+     GET  /groups   every group the linked account belongs to
+     POST /send     { to, body, media_path?, media_mime?, caption? }
+     POST /logout   drop the link
+*/
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import QRCode from 'qrcode';
+import pino from 'pino';
+import makeWASocket, {
+  useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers,
+  getContentType, normalizeMessageContent,
+} from '@whiskeysockets/baileys';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PORT = Number(process.env.WDAP_BRIDGE_PORT || 8787);
+const TOKEN = process.env.WDAP_BRIDGE_TOKEN || 'wdap-local-bridge';
+const AUTH_DIR = path.join(__dirname, 'auth');
+
+const log = pino({ level: process.env.LOG_LEVEL || 'warn' });
+const state = {
+  sock: null, connected: false, qr: null, me: null,
+  groups: new Map(), lastError: null, startedAt: new Date().toISOString(),
+  sent: 0, failed: 0,
+};
+
+// ----------------------------------------------------------- connection
+async function connect() {
+  const { state: auth, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const { version } = await fetchLatestBaileysVersion();
+
+  const sock = makeWASocket({
+    version,
+    auth,
+    logger: log,
+    printQRInTerminal: false,
+    browser: Browsers.appropriate('Desktop'),
+    syncFullHistory: false,
+    markOnlineOnConnect: false,   // do not steal presence from the handset
+    generateHighQualityLinkPreview: true,
+    // Each QR lives 60s instead of the 20s default. The short default is the
+    // main reason a scan fails: the code rotates while the camera focuses.
+    qrTimeout: 60_000,
+  });
+  state.sock = sock;
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', async (u) => {
+    const { connection, lastDisconnect, qr } = u;
+    if (qr) {
+      state.qr = qr;
+      state.qrAt = Date.now();
+      state.qrCount = (state.qrCount || 0) + 1;
+      console.log(`\n  QR code #${state.qrCount} ready, valid about 60 seconds.`);
+      console.log(`  Scan at  http://127.0.0.1:${PORT}/qr`);
+      console.log(`  Or use a pairing code instead (no camera needed):`);
+      console.log(`  http://127.0.0.1:${PORT}/pair?number=91XXXXXXXXXX\n`);
+    }
+    if (connection === 'open') {
+      state.connected = true;
+      state.qr = null;
+      state.me = sock.user;
+      console.log(`  Linked as ${sock.user?.name || ''} (${sock.user?.id || ''})`);
+      await cacheGroups();
+    }
+    if (connection === 'close') {
+      state.connected = false;
+      const code = lastDisconnect?.error?.output?.statusCode;
+      state.lastError = lastDisconnect?.error?.message || String(code || 'closed');
+      const loggedOut = code === DisconnectReason.loggedOut;
+      console.log(`  Connection closed (${state.lastError}).` +
+        (loggedOut ? ' Logged out, delete ./auth and scan again.' : ' Reconnecting...'));
+      if (!loggedOut) setTimeout(() => connect().catch(e => console.error(e)), 3000);
+    }
+  });
+
+  // Delivery and read receipts. These are what turn a "sent" row into
+  // "delivered" and then "read" in the platform: metrics M1 and M9.
+  //
+  // Two events matter, and for groups the second is the important one.
+  // messages.update carries an aggregate status for our own message.
+  // message-receipt.update fires once per participant, which is what lets a
+  // group read be counted as a number of members rather than a yes or no.
+  sock.ev.on('messages.update', (updates) => {
+    for (const u of updates) {
+      if (!u.key?.fromMe) continue;
+      if (u.update?.status === undefined || u.update?.status === null) continue;
+      push(receipts, {
+        kind: 'status', id: u.key.id, to: u.key.remoteJid,
+        to_alt: u.key.remoteJidAlt || '',
+        status: Number(u.update.status), ts_ms: Date.now(),
+      });
+    }
+  });
+
+  sock.ev.on('message-receipt.update', (items) => {
+    for (const it of items) {
+      if (!it.key?.fromMe) continue;
+      const r = it.receipt || {};
+      // WhatsApp's own receipt times, in seconds, when present
+      const sec = (t) => (t == null ? null : (typeof t === 'object' ? (t.toNumber ? t.toNumber() : Number(t.low)) : Number(t)));
+      const dTs = sec(r.receiptTimestamp), rTs = sec(r.readTimestamp || r.playedTimestamp);
+      push(receipts, {
+        kind: 'receipt', id: it.key.id, to: it.key.remoteJid,
+        user: r.userJid || '',
+        delivered: !!(dTs || rTs),
+        read: !!rTs,
+        delivered_ms: dTs ? dTs * 1000 : null,
+        read_ms: rTs ? rTs * 1000 : null,
+        ts_ms: Date.now(),
+      });
+    }
+  });
+
+  // Every group message the linked account sees, in both directions. This is
+  // what the per group view is built from: recent messages, who is active,
+  // replies to our messages and reactions to them.
+  //   notify  = arrived live
+  //   append  = delivered on reconnect, sent while the bridge was down
+  sock.ev.on('messages.upsert', ({ messages, type }) => {
+    for (const m of messages) {
+      const n = normalize(m);
+      if (!n) continue;
+      push(msgBuf, n);
+      if (type === 'notify' && !n.from_me && n.text) {
+        push(inbound, { group_id: n.chat, from: n.sender, text: n.text.slice(0, 500),
+                        quoted_id: n.quoted_id, ts: new Date(n.ts).toISOString() });
+      }
+    }
+  });
+
+  // History sync. On first link WhatsApp pushes a bundle of recent history;
+  // later, fetchMessageHistory requests arrive here as ON_DEMAND batches.
+  sock.ev.on('messaging-history.set', ({ messages = [], contacts = [], syncType }) => {
+    for (const c of contacts) if (c.id && (c.notify || c.name)) names.set(c.id, c.notify || c.name);
+    let n = 0;
+    for (const m of messages) {
+      const x = normalize(m);
+      // Personal 1:1 history is deliberately not forwarded.
+      if (x && x.chat_type === 'group') { x.history = true; push(msgBuf, x); n++; }
+    }
+    if (n) console.log(`  History sync (${syncType}): ${n} group messages captured.`);
+  });
+
+  // Group metadata changes: refresh just that group.
+  sock.ev.on('groups.update', (ups) => ups.forEach(u => u.id && refreshGroup(u.id)));
+  sock.ev.on('group-participants.update', (u) => u.id && refreshGroup(u.id));
+
+  return sock;
+}
+
+// Bounded buffers. The platform drains them on a poll; anything it does not
+// collect in time is dropped rather than growing without limit.
+const inbound = [];
+const receipts = [];
+const msgBuf = [];
+const names = new Map();            // jid -> push name, learnt as we go
+const MAX_BUFFER = 20000;
+function push(buf, item) {
+  buf.push(item);
+  if (buf.length > MAX_BUFFER) buf.splice(0, buf.length - MAX_BUFFER);
+}
+
+const tsMs = (t) => {
+  if (t == null) return Date.now();
+  const v = typeof t === 'object' ? (t.toNumber ? t.toNumber() : Number(t.low)) : Number(t);
+  return v * 1000;
+};
+
+// Housekeeping payloads that are not messages anyone wrote.
+const SKIP = new Set(['protocolMessage', 'senderKeyDistributionMessage',
+  'messageContextInfo', 'keepInChatMessage', 'pinInChatMessage']);
+
+/* Reduce a Baileys message to the fields the platform stores. Returns null
+   for anything that is not a group message or carries no content. */
+const isGroup = (j) => j.endsWith('@g.us');
+const isPerson = (j) => j.endsWith('@s.whatsapp.net') || j.endsWith('@lid');
+
+function normalize(m) {
+  const chat = m.key?.remoteJid || '';
+  if (!m.message || !(isGroup(chat) || isPerson(chat))) return null;
+  const chatType = isGroup(chat) ? 'group' : 'individual';
+  const content = normalizeMessageContent(m.message);
+  const type = content ? getContentType(content) : null;
+  if (!type || SKIP.has(type)) return null;
+  const body = content[type] || {};
+  const sender = m.key.fromMe ? (state.me?.id || 'me')
+    : chatType === 'individual' ? (m.key.remoteJidAlt || chat)
+    : (m.key.participantPn || m.key.participant || m.participant || '');
+  if (m.pushName && sender) names.set(sender, m.pushName);
+
+  if (type === 'reactionMessage') {
+    return {
+      kind: 'reaction', id: m.key.id, chat, chat_type: chatType, chat_alt: m.key.remoteJidAlt || '',
+      sender, from_me: !!m.key.fromMe,
+      sender_name: m.pushName || names.get(sender) || '',
+      target_id: body.key?.id || '', emoji: body.text || '', ts: tsMs(m.messageTimestamp),
+    };
+  }
+
+  const text = typeof body === 'string' ? body
+    : (body.text || body.caption || body.fileName || body.name || '');
+  const ctx = body.contextInfo || {};
+  return {
+    kind: 'message', id: m.key.id, chat, chat_type: chatType, chat_alt: m.key.remoteJidAlt || '',
+    sender, from_me: !!m.key.fromMe,
+    sender_name: m.pushName || names.get(sender) || '',
+    type: type.replace(/Message$/, ''), text: String(text).slice(0, 2000),
+    quoted_id: ctx.stanzaId || '', ts: tsMs(m.messageTimestamp),
+  };
+}
+
+function metaToRecord(jid, meta) {
+  const parts = meta.participants || [];
+  return {
+    id: jid,
+    subject: meta.subject || 'Untitled group',
+    size: meta.size || parts.length,
+    owner: meta.ownerPn || meta.owner || '',
+    created: meta.creation ? meta.creation * 1000 : null,
+    desc: meta.desc || '',
+    announce: !!meta.announce,     // only admins can send
+    restrict: !!meta.restrict,     // only admins can edit group info
+    ephemeral: meta.ephemeralDuration || 0,
+    is_community: !!(meta.isCommunity || meta.isCommunityAnnounce),
+    participants: parts.map(p => {
+      const primary = p.phoneNumber || p.id;
+      const alt = [p.id, p.lid, p.phoneNumber].find(x => x && x !== primary) || '';
+      return { id: primary, alt, admin: p.admin || null, name: names.get(primary) || names.get(alt) || '' };
+    }),
+  };
+}
+
+async function cacheGroups() {
+  try {
+    const all = await state.sock.groupFetchAllParticipating();
+    state.groups.clear();
+    for (const [jid, meta] of Object.entries(all)) state.groups.set(jid, metaToRecord(jid, meta));
+    console.log(`  Cached ${state.groups.size} groups from the linked account.`);
+  } catch (e) {
+    console.error('  Could not fetch groups:', e.message);
+  }
+}
+
+async function refreshGroup(jid) {
+  try {
+    const meta = await state.sock.groupMetadata(jid);
+    state.groups.set(jid, metaToRecord(jid, meta));
+  } catch { /* no longer a member */ }
+}
+
+// -------------------------------------------------------------- http api
+const json = (res, code, obj) => {
+  res.writeHead(code, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(obj));
+};
+
+const readBody = (req) => new Promise((resolve) => {
+  let b = '';
+  req.on('data', c => { b += c; if (b.length > 5e6) req.destroy(); });
+  req.on('end', () => { try { resolve(JSON.parse(b || '{}')); } catch { resolve({}); } });
+});
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+
+  // Live state for the linking page. Polled by the client so the QR image is
+  // only swapped when the code actually rotates, never mid scan.
+  if (url.pathname === '/qr.json') {
+    let img = null;
+    if (state.qr && !state.connected) {
+      img = await QRCode.toDataURL(state.qr, { width: 300, margin: 1 });
+    }
+    return json(res, 200, {
+      connected: state.connected,
+      name: state.me?.name || state.me?.id || '',
+      groups: state.groups.size,
+      qr_image: img,
+      qr_seq: state.qrCount || 0,
+      age_ms: state.qrAt ? Date.now() - state.qrAt : null,
+      pairing_code: state.pairingCode || null,
+      last_error: state.lastError,
+    });
+  }
+
+  // Pairing code: type an 8 character code into the phone instead of scanning.
+  // More reliable than a camera scan, and the usual fix when QR attempts expire.
+  if (url.pathname === '/pair') {
+    const num = (url.searchParams.get('number') || '').replace(/[^0-9]/g, '');
+    if (!num) {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      return res.end(page('Pair without a camera', `
+        <p>Enter the full number of the WhatsApp account, including country code,
+        digits only.</p>
+        <form method="get" action="/pair">
+          <input name="number" placeholder="91XXXXXXXXXX" inputmode="numeric"
+            style="width:100%;padding:10px;border:1px solid #d7e2ee;border-radius:8px;
+                   font-size:16px;text-align:center;margin:10px 0">
+          <button type="submit" style="width:100%;padding:11px;border:0;border-radius:8px;
+            background:#1e5c9e;color:#fff;font-weight:600;font-size:15px;cursor:pointer">
+            Get pairing code</button>
+        </form>
+        <p class="warn">This links a real account. Not covered by WhatsApp's published
+        API terms; account restriction risk applies.</p>`));
+    }
+    if (state.connected) {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      return res.end(page('Already linked', '<p>This bridge is already linked.</p>'));
+    }
+    try {
+      const code = await state.sock.requestPairingCode(num);
+      state.pairingCode = code;
+      console.log(`\n  Pairing code for ${num}:  ${code}\n`);
+      res.writeHead(200, { 'content-type': 'text/html' });
+      return res.end(page('Enter this code on the phone', `
+        <div style="font:700 34px/1.2 ui-monospace,Consolas,monospace;letter-spacing:6px;
+          margin:14px 0;color:#0e2a47">${esc(code)}</div>
+        <p>On the handset: <strong>WhatsApp &rarr; Linked devices &rarr; Link a device
+        &rarr; Link with phone number instead</strong>, then type the code above.</p>
+        <p>The code is valid for a few minutes. This page will say "linked" once it
+        succeeds.</p>`, true));
+    } catch (e) {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      return res.end(page('Could not create a pairing code',
+        `<p class="warn">${esc(e.message || String(e))}</p>
+         <p>Make sure the number is in full international form, digits only, and that
+         the bridge has just started. Try the QR route at
+         <a href="/qr">/qr</a>.</p>`));
+    }
+  }
+
+  if (url.pathname === '/qr') {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    return res.end(`<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Link this bridge</title>
+<style>
+ :root{color-scheme:light dark}
+ body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f1f5fa;
+   color:#12212f;font:15px/1.6 system-ui,Segoe UI,sans-serif;padding:20px}
+ .c{background:#fff;border:1px solid #d7e2ee;border-radius:13px;padding:26px;
+   max-width:430px;text-align:center;box-shadow:0 6px 24px rgba(14,42,71,.08)}
+ h1{font-size:18px;margin:0 0 4px;color:#0e2a47}
+ p{font-size:13px;color:#4d5c6b;margin:9px 0}
+ img{border-radius:9px;border:1px solid #d7e2ee;display:block;margin:14px auto}
+ .ok{color:#0ca30c;font-weight:700;font-size:17px}
+ .warn{color:#8a3b00;background:#fff6ec;border:1px solid #ffd9b0;
+   padding:9px 11px;border-radius:8px;font-size:12px;text-align:left}
+ .meta{font-size:11px;color:#7a8898}
+ .bar{height:4px;background:#e8eff6;border-radius:3px;overflow:hidden;margin:8px 0 2px}
+ .bar i{display:block;height:100%;background:#1e5c9e;width:100%;transition:width .9s linear}
+ a{color:#1e5c9e}
+ @media(prefers-color-scheme:dark){body{background:#0d1520;color:#e9eff7}
+  .c{background:#16202e;border-color:#28394d}h1{color:#cfe0f5}p{color:#a9b8c8}
+  .warn{background:#2a1c0c;border-color:#5a3d16;color:#f5c17a}
+  img{border-color:#28394d}.bar{background:#223040}}
+</style>
+<div class="c" id="c"><h1>Starting…</h1><p>Contacting WhatsApp.</p></div>
+<script>
+let seq = -1;
+async function tick(){
+  let d;
+  try { d = await (await fetch('/qr.json',{cache:'no-store'})).json(); }
+  catch(e){ return; }
+  const c = document.getElementById('c');
+  if (d.connected){
+    c.innerHTML = '<h1>Linked</h1><p class="ok">&#10003; Connected as '+
+      (d.name||'')+'</p><p>'+d.groups+' groups are visible to this bridge.</p>'+
+      '<p>Next: open the platform, go to <strong>Channels</strong>, and click '+
+      '<strong>Import groups from this channel</strong>.</p>';
+    return;   // stop polling
+  }
+  if (d.pairing_code){
+    c.innerHTML = '<h1>Enter this code on the phone</h1>'+
+      '<div style="font:700 34px/1.2 ui-monospace,Consolas,monospace;letter-spacing:6px;'+
+      'margin:14px 0;color:#0e2a47">'+d.pairing_code+'</div>'+
+      '<p>WhatsApp &rarr; Linked devices &rarr; Link a device &rarr; '+
+      'Link with phone number instead.</p>';
+  } else if (d.qr_image){
+    // Only replace the image when the code actually rotated, so it never
+    // changes while the camera is focusing.
+    if (d.qr_seq !== seq){
+      seq = d.qr_seq;
+      c.innerHTML =
+        '<h1>Scan to link</h1>'+
+        '<img src="'+d.qr_image+'" width="300" height="300" alt="QR code">'+
+        '<div class="bar"><i id="b"></i></div>'+
+        '<p class="meta">Code '+d.qr_seq+', valid about 60 seconds</p>'+
+        '<p>On the handset that owns the number: <strong>WhatsApp &rarr; '+
+        'Linked devices &rarr; Link a device</strong>.</p>'+
+        '<p class="meta">No camera? <a href="/pair">Use a pairing code instead</a></p>'+
+        '<p class="warn">This links a real account. Not covered by WhatsApp\\'s '+
+        'published API terms; account restriction risk applies. Only proceed on a '+
+        'number whose owner has authorised it in writing.</p>';
+    }
+    const b = document.getElementById('b');
+    if (b && d.age_ms != null) b.style.width = Math.max(0,100-(d.age_ms/60000*100))+'%';
+  } else {
+    c.innerHTML = '<h1>Waiting for a code…</h1><p>The bridge is reconnecting.</p>'+
+      (d.last_error ? '<p class="meta">'+d.last_error+'</p>' : '');
+    seq = -1;
+  }
+}
+tick(); setInterval(tick, 1500);
+</script>`);
+  }
+
+  // everything below needs the shared token
+  if (req.headers['x-bridge-token'] !== TOKEN) {
+    return json(res, 401, { ok: false, error: 'Bad or missing X-Bridge-Token' });
+  }
+
+  if (url.pathname === '/health') {
+    return json(res, 200, {
+      ok: true, connected: state.connected,
+      awaiting_scan: !!state.qr && !state.connected,
+      user: state.me ? { id: state.me.id, name: state.me.name } : null,
+      groups_cached: state.groups.size,
+      sent: state.sent, failed: state.failed,
+      inbound_buffered: inbound.length,
+      receipts_buffered: receipts.length,
+      messages_buffered: msgBuf.length,
+      last_error: state.lastError, started_at: state.startedAt,
+      qr_url: `http://127.0.0.1:${PORT}/qr`,
+    });
+  }
+
+  if (url.pathname === '/groups') {
+    if (!state.connected) return json(res, 409, { ok: false, error: 'Not linked' });
+    if (url.searchParams.get('refresh')) await cacheGroups();
+    return json(res, 200, { ok: true, groups: [...state.groups.values()] });
+  }
+
+  // Is this number on WhatsApp? Checked before any one to one send, so a
+  // mistyped number fails fast instead of being sent into the void.
+  if (url.pathname === '/check') {
+    if (!state.connected) return json(res, 409, { ok: false, error: 'Not linked' });
+    const num = (url.searchParams.get('number') || '').replace(/[^0-9]/g, '');
+    if (num.length < 8 || num.length > 15) return json(res, 400, { ok: false, error: 'Invalid number' });
+    try {
+      // Returns only numbers that exist, and undefined on an empty lookup.
+      const r = ((await state.sock.onWhatsApp(num)) || [])[0];
+      return json(res, 200, { ok: true, exists: !!(r && r.exists), jid: (r && r.jid) || `${num}@s.whatsapp.net` });
+    } catch (e) {
+      return json(res, 502, { ok: false, error: (e.message || String(e)).slice(0, 200) });
+    }
+  }
+
+  if (url.pathname === '/messages') {
+    const out = msgBuf.splice(0, msgBuf.length);
+    return json(res, 200, { ok: true, messages: out });
+  }
+
+  if (url.pathname === '/group') {
+    if (!state.connected) return json(res, 409, { ok: false, error: 'Not linked' });
+    const jid = url.searchParams.get('jid') || '';
+    await refreshGroup(jid);
+    const g = state.groups.get(jid);
+    return g ? json(res, 200, { ok: true, group: g })
+             : json(res, 404, { ok: false, error: 'Not a member of that group' });
+  }
+
+  // Ask the phone for older messages in one group, paging back from the
+  // oldest message the platform already holds. Results arrive asynchronously
+  // through messaging-history.set and are drained via /messages.
+  if (url.pathname === '/history' && req.method === 'POST') {
+    if (!state.connected) return json(res, 409, { ok: false, error: 'Not linked' });
+    const b = await readBody(req);
+    if (!b.jid || !b.anchor_id || !b.anchor_ts) {
+      return json(res, 400, { ok: false, error: 'jid, anchor_id and anchor_ts are required' });
+    }
+    try {
+      await state.sock.fetchMessageHistory(Math.min(Number(b.count) || 50, 50),
+        { remoteJid: b.jid, id: b.anchor_id, fromMe: !!b.anchor_from_me },
+        Number(b.anchor_ts));
+      return json(res, 200, { ok: true, requested: true });
+    } catch (e) {
+      return json(res, 502, { ok: false, error: (e.message || String(e)).slice(0, 280) });
+    }
+  }
+
+  if (url.pathname === '/inbound') {
+    const out = inbound.splice(0, inbound.length);
+    return json(res, 200, { ok: true, messages: out });
+  }
+
+  // Draining endpoint: returns buffered receipts and clears them, so the
+  // platform never applies the same receipt twice.
+  if (url.pathname === '/receipts') {
+    const out = receipts.splice(0, receipts.length);
+    return json(res, 200, { ok: true, receipts: out });
+  }
+
+  // Test hook: lets the receipt pipeline be exercised without a live account.
+  // Refuses unless WDAP_BRIDGE_ALLOW_INJECT=1 is set.
+  if (url.pathname === '/_inject' && req.method === 'POST') {
+    if (process.env.WDAP_BRIDGE_ALLOW_INJECT !== '1') {
+      return json(res, 403, { ok: false, error: 'Injection disabled' });
+    }
+    const b = await readBody(req);
+    for (const r of (b.receipts || [])) push(receipts, r);
+    for (const m of (b.messages || [])) push(inbound, m);
+    return json(res, 200, {
+      ok: true, receipts: (b.receipts || []).length,
+      messages: (b.messages || []).length,
+    });
+  }
+
+  if (url.pathname === '/send' && req.method === 'POST') {
+    if (!state.connected) {
+      return json(res, 409, { ok: false, error: 'Not linked', retryable: true });
+    }
+    const b = await readBody(req);
+    if (!b.to || (!b.body && !b.media_path)) {
+      return json(res, 400, { ok: false, error: 'to and body (or media_path) are required' });
+    }
+    try {
+      let payload;
+      if (b.media_path && fs.existsSync(b.media_path)) {
+        const mime = b.media_mime || '';
+        const caption = b.caption || b.body || '';
+        if (mime.startsWith('image/')) payload = { image: { url: b.media_path }, caption };
+        else if (mime.startsWith('video/')) payload = { video: { url: b.media_path }, caption };
+        else if (mime.startsWith('audio/')) payload = { audio: { url: b.media_path }, mimetype: mime };
+        else payload = {
+          document: { url: b.media_path },
+          mimetype: mime || 'application/octet-stream',
+          fileName: b.file_name || path.basename(b.media_path), caption,
+        };
+      } else {
+        payload = { text: b.body };
+      }
+      // Reply with a quote. Baileys needs a message object to quote; the key
+      // plus the original text is enough for WhatsApp to render the quote.
+      const opts = {};
+      if (b.quoted && b.quoted.id) {
+        opts.quoted = {
+          key: { remoteJid: b.to, id: b.quoted.id, fromMe: !!b.quoted.from_me,
+                 participant: b.quoted.from_me ? undefined : (b.quoted.participant || undefined) },
+          message: { conversation: String(b.quoted.text || '') },
+        };
+      }
+      const sent = await state.sock.sendMessage(b.to, payload, opts);
+      state.sent++;
+      return json(res, 200, { ok: true, id: sent?.key?.id || '',
+                              ts: Date.now() });
+    } catch (e) {
+      state.failed++;
+      const msg = e?.message || String(e);
+      // rate limiting and transient transport faults are worth a retry
+      const retryable = /rate|timed? ?out|overloaded|connection|closed|503|429/i.test(msg);
+      return json(res, 502, { ok: false, error: msg.slice(0, 280), retryable });
+    }
+  }
+
+  if (url.pathname === '/logout' && req.method === 'POST') {
+    try { await state.sock?.logout(); } catch { }
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    state.connected = false; state.me = null; state.groups.clear();
+    return json(res, 200, { ok: true, message: 'Unlinked. Restart and scan again.' });
+  }
+
+  json(res, 404, { ok: false, error: 'Unknown endpoint' });
+});
+
+const esc = (s) => String(s).replace(/[&<>"]/g,
+  c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+const page = (title, body, refresh) => `<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+${refresh ? '<meta http-equiv="refresh" content="3">' : ''}
+<title>${esc(title)}</title>
+<style>
+ :root{color-scheme:light dark}
+ body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f1f5fa;
+   color:#12212f;font:15px/1.6 system-ui,Segoe UI,sans-serif;padding:20px}
+ .c{background:#fff;border:1px solid #d7e2ee;border-radius:13px;padding:28px;
+   max-width:440px;text-align:center;box-shadow:0 6px 24px rgba(14,42,71,.08)}
+ h1{font-size:18px;margin:0 0 12px;color:#0e2a47}
+ p{font-size:13px;color:#4d5c6b;margin:10px 0}
+ .warn{color:#8a3b00;background:#fff6ec;border:1px solid #ffd9b0;
+   padding:9px 11px;border-radius:8px;font-size:12px;text-align:left}
+ img{border-radius:9px;border:1px solid #d7e2ee}
+ @media(prefers-color-scheme:dark){body{background:#0d1520;color:#e9eff7}
+  .c{background:#16202e;border-color:#28394d}h1{color:#cfe0f5}p{color:#a9b8c8}
+  .warn{background:#2a1c0c;border-color:#5a3d16;color:#f5c17a}}
+</style><div class="c"><h1>${esc(title)}</h1>${body}</div>`;
+
+// ------------------------------------------------------------------ boot
+console.log('\n  WDAP linked device bridge');
+console.log('  Gsure Technologies Private Limited\n');
+console.log('  This operates a REAL WhatsApp account as a linked device.');
+console.log('  Not covered by WhatsApp API terms. Account restriction risk applies.');
+console.log('  Use only on a number whose owner has authorised it in writing.\n');
+
+server.listen(PORT, '127.0.0.1', () => {
+  console.log(`  Bridge listening on http://127.0.0.1:${PORT}`);
+  console.log(`  Link the account at http://127.0.0.1:${PORT}/qr\n`);
+});
+
+connect().catch(e => {
+  console.error('  Failed to start WhatsApp connection:', e.message);
+  state.lastError = e.message;
+});
